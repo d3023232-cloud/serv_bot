@@ -101,9 +101,9 @@ INVENTORY_TEXT = (
     "🪨 Камень: <b>{stone}</b>"
 )
 
-GATHER_WOOD_SUCCESS = "🪵 <b>Ты срубил дерево!</b>\n\nПолучено: <b>+5 дерева</b>"
+GATHER_WOOD_SUCCESS = "🪵 <b>Ты срубил дерево!</b>\n\nПолучено: <b>+{amount} дерева</b>"
 GATHER_WOOD_COOLDOWN = "⏳ Дерево восстанавливается.\n\nПодожди ещё <b>{seconds} сек</b>."
-GATHER_STONE_SUCCESS = "🪨 <b>Ты добыл камень!</b>\n\nПолучено: <b>+3 камня</b>"
+GATHER_STONE_SUCCESS = "🪨 <b>Ты добыл камень!</b>\n\nПолучено: <b>+{amount} камня</b>"
 GATHER_STONE_COOLDOWN = "⏳ Камни пока не появились.\n\nПодожди ещё <b>{seconds} сек</b>."
 
 CABIN_BUILD_SUCCESS = (
@@ -592,7 +592,7 @@ async def gather_wood_handler(message: Message) -> None:
             success, result = await gather_wood(db, user["user_id"], user)
 
             if success:
-                await message.answer(GATHER_WOOD_SUCCESS)
+                await message.answer(GATHER_WOOD_SUCCESS.format(amount=result))
             else:
                 await message.answer(GATHER_WOOD_COOLDOWN.format(seconds=result))
     except Exception:
@@ -608,7 +608,7 @@ async def gather_stone_handler(message: Message) -> None:
             success, result = await gather_stone(db, user["user_id"], user)
 
             if success:
-                await message.answer(GATHER_STONE_SUCCESS)
+                await message.answer(GATHER_STONE_SUCCESS.format(amount=result))
             else:
                 await message.answer(GATHER_STONE_COOLDOWN.format(seconds=result))
     except Exception:
