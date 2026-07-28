@@ -325,10 +325,10 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 # ── 6.1 Добыча ресурсов ──
 
-WOOD_COOLDOWN = 120   # 2 минуты
-STONE_COOLDOWN = 180  # 3 минуты
-WOOD_YIELD = 5
-STONE_YIELD = 3
+WOOD_COOLDOWN = 30   #  0.5 минуты
+STONE_COOLDOWN = 60  #  1 минуты
+WOOD_YIELD = 2
+STONE_YIELD = 1
 
 
 async def gather_wood(
