@@ -13,6 +13,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -325,10 +326,10 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 # ── 6.1 Добыча ресурсов ──
 
-WOOD_COOLDOWN = 30   #  0.5 минуты
-STONE_COOLDOWN = 60  #  1 минуты
-WOOD_YIELD = 2
-STONE_YIELD = 1
+WOOD_COOLDOWN = 120   # 2 минуты
+STONE_COOLDOWN = 180  # 3 минуты
+WOOD_YIELD = 5
+STONE_YIELD = 3
 
 
 async def gather_wood(
@@ -530,7 +531,6 @@ async def check_and_notify(bot: Bot) -> None:
                         stone=stone,
                         max_stone=max_stone,
                     ),
-                    parse_mode="HTML",
                 )
                 await set_notification_state(db, user_id, now)
                 logger.info("Уведомление отправлено пользователю %s", telegram_id)
@@ -561,7 +561,7 @@ async def cmd_start(message: Message) -> None:
             cabin = await get_cabin(db, user["user_id"])
 
             text = WELCOME_BACK if (cabin and cabin["is_built"]) else WELCOME_NEW
-            await message.answer(text, reply_markup=main_menu(), parse_mode="HTML")
+            await message.answer(text, reply_markup=main_menu())
     except Exception:
         await message.answer(ERROR_GENERAL)
 
@@ -575,7 +575,7 @@ async def show_inventory(message: Message) -> None:
         async with aiosqlite.connect(DB_PATH) as db:
             user = await get_or_create_user(db, message.from_user.id)
             text = INVENTORY_TEXT.format(wood=user["wood"], stone=user["stone"])
-            await message.answer(text, parse_mode="HTML")
+            await message.answer(text)
     except Exception:
         await message.answer(ERROR_GENERAL)
 
@@ -637,9 +637,9 @@ async def _show_cabin_status(
             ]
         )
         if edit:
-            await message.edit_text(CABIN_NOT_BUILT, reply_markup=kb, parse_mode="HTML")
+            await message.edit_text(CABIN_NOT_BUILT, reply_markup=kb)
         else:
-            await message.answer(CABIN_NOT_BUILT, reply_markup=kb, parse_mode="HTML")
+            await message.answer(CABIN_NOT_BUILT, reply_markup=kb)
         return
 
     cabin = await apply_cabin_tick(db, user["user_id"])
@@ -669,9 +669,9 @@ async def _show_cabin_status(
     )
 
     if edit:
-        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await message.edit_text(text, reply_markup=kb)
     else:
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await message.answer(text, reply_markup=kb)
 
 
 @cabin_router.message(lambda msg: msg.text == BTN_MY_CABIN)
@@ -693,7 +693,7 @@ async def build_cabin_callback(call: CallbackQuery) -> None:
             success, _ = await build_cabin(db, user["user_id"], user)
 
             if success:
-                await call.message.edit_text(CABIN_BUILD_SUCCESS, parse_mode="HTML")
+                await call.message.edit_text(CABIN_BUILD_SUCCESS)
             else:
                 await call.answer(
                     CABIN_BUILD_NO_RESOURCES.format(wood=user["wood"], stone=user["stone"]),
@@ -751,7 +751,7 @@ async def main() -> None:
     """Главная корутина: подготовка БД и запуск polling."""
     await init_db()
 
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
 
     dp.include_routers(
