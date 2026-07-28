@@ -5,6 +5,7 @@ Production-ready: type hints, логирование, обработка оши�
 """
 
 import os
+import pathlib
 import asyncio
 import logging
 from datetime import datetime
@@ -30,13 +31,24 @@ import aiosqlite
 load_dotenv()
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-DB_PATH: str = os.getenv("DB_PATH", "survival_bot.db")
+
+# Хостинг может задавать DATA_DIR (например, /app/data) для хранения файлов.
+# Приоритет: DATA_DIR > DB_PATH из .env > локальный файл.
+DATA_DIR: str = os.getenv("DATA_DIR", "")
+DB_PATH: str = os.getenv("DB_PATH", "")
+
+if DATA_DIR:
+    pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    DB_PATH = os.path.join(DATA_DIR, "survival_bot.db")
+elif not DB_PATH:
+    DB_PATH = "survival_bot.db"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env файле")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.info("DB_PATH = %s", DB_PATH)
 
 
 # ═══════════════════════════════════════════════════════════════
