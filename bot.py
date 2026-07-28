@@ -14,6 +14,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -326,10 +327,10 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 # ── 6.1 Добыча ресурсов ──
 
-WOOD_COOLDOWN = 120   # 2 минуты
-STONE_COOLDOWN = 180  # 3 минуты
-WOOD_YIELD = 5
-STONE_YIELD = 3
+WOOD_COOLDOWN = 30    # 30 секунд
+STONE_COOLDOWN = 60   # 1 минута
+WOOD_YIELD = 2
+STONE_YIELD = 1
 
 
 async def gather_wood(
@@ -751,7 +752,7 @@ async def main() -> None:
     """Главная корутина: подготовка БД и запуск polling."""
     await init_db()
 
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
     dp.include_routers(
