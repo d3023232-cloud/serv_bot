@@ -1,5 +1,5 @@
 """
-Survival Bot — монолитная версия с мини-игрой 3x3 и рынком.
+Survival Bot — монолитная версия с мини-игрой 3x3 и рынком (ввод количества).
 Production-ready: type hints, логирование, обработка ошибок, i18n, SQLite, FSM.
 """
 
@@ -170,26 +170,38 @@ MARKET_WELCOME = (
 MARKET_BUY_HEADER = "🛒 <b>Режим: ПОКУПКА</b>\n\nВыбери товар:"
 MARKET_SELL_HEADER = "💰 <b>Режим: ПРОДАЖА</b>\n\nВыбери товар:"
 
-BUY_WOOD_TEXT = "🪵 Купить дерево — <b>{price}💰</b>"
-BUY_STONE_TEXT = "🪨 Купить камень — <b>{price}💰</b>"
-SELL_WOOD_TEXT = "🪵 Продать дерево — <b>{price}💰</b>"
-SELL_STONE_TEXT = "🪨 Продать камень — <b>{price}💰</b>"
+# Inline-кнопки — без HTML, Telegram не парсит теги в тексте кнопок
+BUY_WOOD_TEXT = "🪵 Купить дерево — 5💰"
+BUY_STONE_TEXT = "🪨 Купить камень — 10💰"
+SELL_WOOD_TEXT = "🪵 Продать дерево — 3💰"
+SELL_STONE_TEXT = "🪨 Продать камень — 6💰"
+
+MARKET_ENTER_AMOUNT = (
+    "{mode_emoji} <b>Режим: {mode}</b>\n\n"
+    "{emoji} {resource} — <b>{price}💰</b> за шт\n\n"
+    "Введи количество, которое хочешь {action}:"
+)
+MARKET_INVALID_AMOUNT = (
+    "❌ <b>Некорректное количество!</b>\n\n"
+    "Введи целое число больше 0."
+)
+MARKET_CANCELLED = "❌ Операция отменена."
 
 BUY_SUCCESS = (
     "✅ <b>Покупка совершена!</b>\n\n"
-    "Ты купил <b>{amount} {resource}</b> за <b>{price}💰</b>.\n"
+    "Ты купил <b>{amount} {resource}</b> за <b>{total}💰</b>.\n"
     "💰 Монеты: {coins_before} → {coins_after}\n"
     "{emoji} {resource_cap}: {res_before} → {res_after}"
 )
 BUY_NO_MONEY = (
     "❌ <b>Недостаточно монет!</b>\n\n"
-    "Нужно: <b>{price}💰</b>\n"
+    "Нужно: <b>{total}💰</b>\n"
     "У тебя: <b>{coins}💰</b>"
 )
 
 SELL_SUCCESS = (
     "✅ <b>Продажа совершена!</b>\n\n"
-    "Ты продал <b>{amount} {resource}</b> за <b>{price}💰</b>.\n"
+    "Ты продал <b>{amount} {resource}</b> за <b>{total}💰</b>.\n"
     "💰 Монеты: {coins_before} → {coins_after}\n"
     "{emoji} {resource_cap}: {res_before} → {res_after}"
 )
@@ -269,7 +281,6 @@ async def init_db() -> None:
 async def migrate_db() -> None:
     """Применяет миграции к существующей базе данных."""
     async with aiosqlite.connect(DB_PATH) as db:
-        # Проверяем, есть ли колонка coins
         cursor = await db.execute("PRAGMA table_info(users)")
         columns = [row[1] for row in await cursor.fetchall()]
         if "coins" not in columns:
@@ -462,14 +473,14 @@ def buy_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=BUY_WOOD_TEXT.format(price=PRICE_BUY_WOOD),
-                    callback_data="buy:wood:1",
+                    text=BUY_WOOD_TEXT,
+                    callback_data="buy:wood",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text=BUY_STONE_TEXT.format(price=PRICE_BUY_STONE),
-                    callback_data="buy:stone:1",
+                    text=BUY_STONE_TEXT,
+                    callback_data="buy:stone",
                 ),
             ],
             [
@@ -485,19 +496,28 @@ def sell_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=SELL_WOOD_TEXT.format(price=PRICE_SELL_WOOD),
-                    callback_data="sell:wood:1",
+                    text=SELL_WOOD_TEXT,
+                    callback_data="sell:wood",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text=SELL_STONE_TEXT.format(price=PRICE_SELL_STONE),
-                    callback_data="sell:stone:1",
+                    text=SELL_STONE_TEXT,
+                    callback_data="sell:stone",
                 ),
             ],
             [
                 InlineKeyboardButton(text="🔙 Назад", callback_data="market:back"),
             ],
+        ]
+    )
+
+
+def cancel_kb() -> InlineKeyboardMarkup:
+    """Клавиатура отмены операции ввода количества."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="market:cancel")],
         ]
     )
 
@@ -522,18 +542,18 @@ def _build_game_kb(resource: str, target_idx: int) -> InlineKeyboardMarkup:
 
 # ── 6.1 Рынок: цены (админские) ──
 
-PRICE_BUY_WOOD = 5    # 💰 за 1 🪵
-PRICE_SELL_WOOD = 3   # 💰 за 1 🪵
-PRICE_BUY_STONE = 10  # 💰 за 1 🪨
-PRICE_SELL_STONE = 6  # 💰 за 1 🪨
+PRICE_BUY_WOOD = 5
+PRICE_SELL_WOOD = 3
+PRICE_BUY_STONE = 10
+PRICE_SELL_STONE = 6
 
 # ── 6.2 Добыча ресурсов — константы ──
 
-WOOD_COOLDOWN = 30    # 30 секунд
-STONE_COOLDOWN = 60   # 1 минута
-WOOD_YIELD = 2        # за одно попадание
-STONE_YIELD = 1       # за одно попадание
-GAME_HITS_NEEDED = 3  # попаданий подряд для успеха
+WOOD_COOLDOWN = 30
+STONE_COOLDOWN = 60
+WOOD_YIELD = 2
+STONE_YIELD = 1
+GAME_HITS_NEEDED = 3
 
 
 # ── 6.3 Хижина ──
@@ -541,8 +561,8 @@ GAME_HITS_NEEDED = 3  # попаданий подряд для успеха
 TICK_MINUTES = 10
 CONSUMPTION_PER_TICK_WOOD = 1
 CONSUMPTION_PER_TICK_STONE = 1
-DECAY_SLOW_PER_TICK = 0.5   # 3% в час при наличии ресурсов
-DECAY_FAST_PER_TICK = 1.0   # 6% в час без ресурсов
+DECAY_SLOW_PER_TICK = 0.5
+DECAY_FAST_PER_TICK = 1.0
 
 
 async def apply_cabin_tick(
@@ -641,8 +661,8 @@ async def add_to_storage(
 
 # ── 6.4 Уведомления ──
 
-CHECK_INTERVAL = 600   # 10 минут
-NOTIFY_COOLDOWN = 7200  # 2 часа между повторными уведомлениями
+CHECK_INTERVAL = 600
+NOTIFY_COOLDOWN = 7200
 THRESHOLD = 0.30
 
 
@@ -705,12 +725,17 @@ async def check_and_notify(bot: Bot) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. FSM — МАШИНА СОСТОЯНИЙ ДЛЯ МИНИ-ИГРЫ
+# 7. FSM — МАШИНА СОСТОЯНИЙ
 # ═══════════════════════════════════════════════════════════════
 
 class GatherGame(StatesGroup):
     """Состояние активной мини-игры добычи ресурсов."""
     playing = State()
+
+
+class MarketState(StatesGroup):
+    """Состояние ввода количества на рынке."""
+    entering_amount = State()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -742,7 +767,7 @@ async def cmd_start(message: Message) -> None:
         await message.answer(ERROR_GENERAL)
 
 
-# ── Инвентарь (обновлён с монетами) ──
+# ── Инвентарь ──
 
 @inventory_router.message(lambda msg: msg.text == BTN_INVENTORY)
 async def show_inventory(message: Message) -> None:
@@ -944,23 +969,25 @@ async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
-# ── Рынок: вход ──
+# ═══════════════════════════════════════════════════════════════
+# 9. РЫНОК — ХЕНДЛЕРЫ
+# ═══════════════════════════════════════════════════════════════
+
+# ── Вход на рынок ──
 
 @market_router.message(lambda msg: msg.text == BTN_MARKET)
 async def market_entry(message: Message) -> None:
     """Открывает главное меню рынка."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            user = await get_or_create_user(db, message.from_user.id)
-            await message.answer(
-                MARKET_WELCOME,
-                reply_markup=market_menu(),
-            )
+        await message.answer(
+            MARKET_WELCOME,
+            reply_markup=market_menu(),
+        )
     except Exception:
         await message.answer(ERROR_GENERAL)
 
 
-# ── Рынок: покупка ──
+# ── Выбор режима: покупка / продажа ──
 
 @market_router.callback_query(F.data == "market:buy")
 async def market_buy(call: CallbackQuery) -> None:
@@ -975,8 +1002,6 @@ async def market_buy(call: CallbackQuery) -> None:
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
-# ── Рынок: продажа ──
-
 @market_router.callback_query(F.data == "market:sell")
 async def market_sell(call: CallbackQuery) -> None:
     """Показывает меню продажи товаров."""
@@ -990,12 +1015,13 @@ async def market_sell(call: CallbackQuery) -> None:
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
-# ── Рынок: назад в главное меню ──
+# ── Назад в главное меню рынка ──
 
 @market_router.callback_query(F.data == "market:back")
-async def market_back(call: CallbackQuery) -> None:
+async def market_back(call: CallbackQuery, state: FSMContext) -> None:
     """Возвращает пользователя в главное меню рынка."""
     try:
+        await state.clear()
         await call.message.edit_text(
             MARKET_WELCOME,
             reply_markup=market_menu(),
@@ -1005,117 +1031,215 @@ async def market_back(call: CallbackQuery) -> None:
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
-# ── Рынок: покупка товара ──
+# ── Выбор товара для покупки ──
 
 @market_router.callback_query(F.data.startswith("buy:"))
-async def buy_item(call: CallbackQuery) -> None:
-    """Обрабатывает покупку ресурса у NPC-рынка."""
+async def buy_select(call: CallbackQuery, state: FSMContext) -> None:
+    """Запрашивает количество для покупки выбранного товара."""
     try:
-        parts = call.data.split(":")
-        if len(parts) != 3:
-            return
-        resource = parts[1]  # wood или stone
-        amount = int(parts[2])
-
+        resource = call.data.split(":")[1]
         price = PRICE_BUY_WOOD if resource == "wood" else PRICE_BUY_STONE
-        total_price = price * amount
         emoji = "🪵" if resource == "wood" else "🪨"
         res_name = "дерево" if resource == "wood" else "камень"
-        res_name_cap = "Дерево" if resource == "wood" else "Камень"
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            user = await get_or_create_user(db, call.from_user.id)
-            coins = user.get("coins", 0)
+        text = MARKET_ENTER_AMOUNT.format(
+            mode_emoji="🛒",
+            mode="ПОКУПКА",
+            emoji=emoji,
+            resource=res_name,
+            price=price,
+            action="купить",
+        )
 
-            if coins < total_price:
-                await call.answer(
-                    BUY_NO_MONEY.format(price=total_price, coins=coins),
-                    show_alert=True,
-                )
-                return
-
-            new_coins = coins - total_price
-            new_wood = user["wood"] + (amount if resource == "wood" else 0)
-            new_stone = user["stone"] + (amount if resource == "stone" else 0)
-
-            await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
-
-            text = BUY_SUCCESS.format(
-                amount=amount,
-                resource=res_name,
-                price=total_price,
-                coins_before=coins,
-                coins_after=new_coins,
-                emoji=emoji,
-                resource_cap=res_name_cap,
-                res_before=user["wood"] if resource == "wood" else user["stone"],
-                res_after=new_wood if resource == "wood" else new_stone,
-            )
-
-        await call.message.edit_text(text, reply_markup=buy_menu())
-        await call.answer("✅ Куплено!")
-        logger.info("Пользователь %s купил %s %s за %s💰",
-                    call.from_user.id, amount, resource, total_price)
+        await call.message.edit_text(text, reply_markup=cancel_kb())
+        await state.set_state(MarketState.entering_amount)
+        await state.update_data(
+            operation="buy",
+            resource=resource,
+            price=price,
+            chat_id=call.message.chat.id,
+            msg_id=call.message.message_id,
+        )
+        await call.answer()
     except Exception:
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
-# ── Рынок: продажа товара ──
+# ── Выбор товара для продажи ──
 
 @market_router.callback_query(F.data.startswith("sell:"))
-async def sell_item(call: CallbackQuery) -> None:
-    """Обрабатывает продажу ресурса NPC-рынку."""
+async def sell_select(call: CallbackQuery, state: FSMContext) -> None:
+    """Запрашивает количество для продажи выбранного товара."""
     try:
-        parts = call.data.split(":")
-        if len(parts) != 3:
-            return
-        resource = parts[1]  # wood или stone
-        amount = int(parts[2])
-
+        resource = call.data.split(":")[1]
         price = PRICE_SELL_WOOD if resource == "wood" else PRICE_SELL_STONE
-        total_price = price * amount
+        emoji = "🪵" if resource == "wood" else "🪨"
+        res_name = "дерево" if resource == "wood" else "камень"
+
+        text = MARKET_ENTER_AMOUNT.format(
+            mode_emoji="💰",
+            mode="ПРОДАЖА",
+            emoji=emoji,
+            resource=res_name,
+            price=price,
+            action="продать",
+        )
+
+        await call.message.edit_text(text, reply_markup=cancel_kb())
+        await state.set_state(MarketState.entering_amount)
+        await state.update_data(
+            operation="sell",
+            resource=resource,
+            price=price,
+            chat_id=call.message.chat.id,
+            msg_id=call.message.message_id,
+        )
+        await call.answer()
+    except Exception:
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# ── Отмена ввода количества ──
+
+@market_router.callback_query(F.data == "market:cancel")
+async def market_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    """Отменяет ввод количества и возвращает в меню рынка."""
+    try:
+        await state.clear()
+        await call.message.edit_text(
+            MARKET_WELCOME,
+            reply_markup=market_menu(),
+        )
+        await call.answer("Отменено")
+    except Exception:
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# ── Ввод количества и совершение сделки ──
+
+@market_router.message(MarketState.entering_amount)
+async def market_process_amount(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Обрабатывает введённое количество, проверяет баланс и совершает сделку."""
+    try:
+        data = await state.get_data()
+        operation = data["operation"]
+        resource = data["resource"]
+        price = data["price"]
+        msg_id = data["msg_id"]
+        chat_id = data["chat_id"]
+
+        # Проверка числа
+        try:
+            amount = int(message.text.strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await message.delete()
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=MARKET_INVALID_AMOUNT,
+                reply_markup=cancel_kb(),
+            )
+            return
+
+        total = price * amount
         emoji = "🪵" if resource == "wood" else "🪨"
         res_name = "дерево" if resource == "wood" else "камень"
         res_name_cap = "Дерево" if resource == "wood" else "Камень"
 
         async with aiosqlite.connect(DB_PATH) as db:
-            user = await get_or_create_user(db, call.from_user.id)
-            have = user["wood"] if resource == "wood" else user["stone"]
+            user = await get_or_create_user(db, message.from_user.id)
+            coins = user.get("coins", 0)
 
-            if have < amount:
-                await call.answer(
-                    SELL_NO_RESOURCES.format(amount=amount, resource=res_name, have=have),
-                    show_alert=True,
+            if operation == "buy":
+                # Проверка монет
+                if coins < total:
+                    await message.delete()
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=BUY_NO_MONEY.format(total=total, coins=coins),
+                        reply_markup=buy_menu(),
+                    )
+                    await state.clear()
+                    return
+
+                new_coins = coins - total
+                new_wood = user["wood"] + (amount if resource == "wood" else 0)
+                new_stone = user["stone"] + (amount if resource == "stone" else 0)
+
+                await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
+
+                text = BUY_SUCCESS.format(
+                    amount=amount,
+                    resource=res_name,
+                    total=total,
+                    coins_before=coins,
+                    coins_after=new_coins,
+                    emoji=emoji,
+                    resource_cap=res_name_cap,
+                    res_before=user["wood"] if resource == "wood" else user["stone"],
+                    res_after=new_wood if resource == "wood" else new_stone,
                 )
-                return
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=text,
+                    reply_markup=buy_menu(),
+                )
+                logger.info("Пользователь %s купил %s %s за %s💰",
+                            message.from_user.id, amount, resource, total)
 
-            new_coins = user.get("coins", 0) + total_price
-            new_wood = user["wood"] - (amount if resource == "wood" else 0)
-            new_stone = user["stone"] - (amount if resource == "stone" else 0)
+            else:  # sell
+                have = user["wood"] if resource == "wood" else user["stone"]
+                if have < amount:
+                    await message.delete()
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=SELL_NO_RESOURCES.format(amount=amount, resource=res_name, have=have),
+                        reply_markup=sell_menu(),
+                    )
+                    await state.clear()
+                    return
 
-            await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
+                new_coins = coins + total
+                new_wood = user["wood"] - (amount if resource == "wood" else 0)
+                new_stone = user["stone"] - (amount if resource == "stone" else 0)
 
-            text = SELL_SUCCESS.format(
-                amount=amount,
-                resource=res_name,
-                price=total_price,
-                coins_before=user.get("coins", 0),
-                coins_after=new_coins,
-                emoji=emoji,
-                resource_cap=res_name_cap,
-                res_before=have,
-                res_after=new_wood if resource == "wood" else new_stone,
-            )
+                await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
 
-        await call.message.edit_text(text, reply_markup=sell_menu())
-        await call.answer("✅ Продано!")
-        logger.info("Пользователь %s продал %s %s за %s💰",
-                    call.from_user.id, amount, resource, total_price)
+                text = SELL_SUCCESS.format(
+                    amount=amount,
+                    resource=res_name,
+                    total=total,
+                    coins_before=coins,
+                    coins_after=new_coins,
+                    emoji=emoji,
+                    resource_cap=res_name_cap,
+                    res_before=have,
+                    res_after=new_wood if resource == "wood" else new_stone,
+                )
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=text,
+                    reply_markup=sell_menu(),
+                )
+                logger.info("Пользователь %s продал %s %s за %s💰",
+                            message.from_user.id, amount, resource, total)
+
+        await state.clear()
+        await message.delete()
     except Exception:
-        await call.answer(ERROR_GENERAL, show_alert=True)
+        await message.answer(ERROR_GENERAL)
+        await state.clear()
 
 
-# ── Хижина ──
+# ═══════════════════════════════════════════════════════════════
+# 10. ХИЖИНА — ХЕНДЛЕРЫ
+# ═══════════════════════════════════════════════════════════════
 
 async def _show_cabin_status(
     db: aiosqlite.Connection,
@@ -1245,7 +1369,7 @@ async def repair_cabin_callback(call: CallbackQuery) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 9. ТОЧКА ВХОДА
+# 11. ТОЧКА ВХОДА
 # ═══════════════════════════════════════════════════════════════
 
 async def main() -> None:
@@ -1264,9 +1388,7 @@ async def main() -> None:
         market_router,
     )
 
-    # Фоновый цикл уведомлений о низких ресурсах
     asyncio.create_task(start_notification_loop(bot))
-
     await dp.start_polling(bot)
 
 
