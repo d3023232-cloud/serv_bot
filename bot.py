@@ -1,5 +1,5 @@
 """
-Survival Bot — монолитная версия с мини-игрой 3x3.
+Survival Bot — монолитная версия с мини-игрой 3x3 и рынком.
 Production-ready: type hints, логирование, обработка ошибок, i18n, SQLite, FSM.
 """
 
@@ -76,6 +76,7 @@ BTN_MY_CABIN = "🏠 Моя хижина"
 BTN_INVENTORY = "🎒 Инвентарь"
 BTN_GATHER_WOOD = "🪵 Добыть дерево"
 BTN_GATHER_STONE = "🪨 Добыть камень"
+BTN_MARKET = "🛒 Рынок"
 
 CABIN_NOT_BUILT = (
     "🏠 <b>Хижина</b>\n\n"
@@ -97,6 +98,7 @@ CABIN_STATUS = (
 
 INVENTORY_TEXT = (
     "🎒 <b>Инвентарь</b>\n\n"
+    "💰 Монеты: <b>{coins}</b>\n"
     "🪵 Дерево: <b>{wood}</b>\n"
     "🪨 Камень: <b>{stone}</b>"
 )
@@ -159,6 +161,44 @@ GATHER_STONE_ALREADY = (
     "Заверши текущую добычу или дождись окончания."
 )
 
+# ── Рынок ──
+MARKET_WELCOME = (
+    "🛒 <b>Рынок</b>\n\n"
+    "Здесь можно торговать ресурсами.\n"
+    "Выбери, что хочешь сделать:"
+)
+MARKET_BUY_HEADER = "🛒 <b>Режим: ПОКУПКА</b>\n\nВыбери товар:"
+MARKET_SELL_HEADER = "💰 <b>Режим: ПРОДАЖА</b>\n\nВыбери товар:"
+
+BUY_WOOD_TEXT = "🪵 Купить дерево — <b>{price}💰</b>"
+BUY_STONE_TEXT = "🪨 Купить камень — <b>{price}💰</b>"
+SELL_WOOD_TEXT = "🪵 Продать дерево — <b>{price}💰</b>"
+SELL_STONE_TEXT = "🪨 Продать камень — <b>{price}💰</b>"
+
+BUY_SUCCESS = (
+    "✅ <b>Покупка совершена!</b>\n\n"
+    "Ты купил <b>{amount} {resource}</b> за <b>{price}💰</b>.\n"
+    "💰 Монеты: {coins_before} → {coins_after}\n"
+    "{emoji} {resource_cap}: {res_before} → {res_after}"
+)
+BUY_NO_MONEY = (
+    "❌ <b>Недостаточно монет!</b>\n\n"
+    "Нужно: <b>{price}💰</b>\n"
+    "У тебя: <b>{coins}💰</b>"
+)
+
+SELL_SUCCESS = (
+    "✅ <b>Продажа совершена!</b>\n\n"
+    "Ты продал <b>{amount} {resource}</b> за <b>{price}💰</b>.\n"
+    "💰 Монеты: {coins_before} → {coins_after}\n"
+    "{emoji} {resource_cap}: {res_before} → {res_after}"
+)
+SELL_NO_RESOURCES = (
+    "❌ <b>Недостаточно ресурсов!</b>\n\n"
+    "Нужно: <b>{amount} {resource}</b>\n"
+    "У тебя: <b>{have} {resource}</b>"
+)
+
 CABIN_BUILD_SUCCESS = (
     "🏠 <b>Хижина построена!</b>\n\n"
     "Теперь у тебя есть надёжное убежище. Не забудь пополнять шкаф "
@@ -181,7 +221,7 @@ ERROR_GENERAL = "❌ Произошла ошибка. Попробуй позж�
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. БАЗА ДАННЫХ — ИНИЦИАЛИЗАЦИЯ
+# 3. БАЗА ДАННЫХ — ИНИЦИАЛИЗАЦИЯ И МИГРАЦИИ
 # ═══════════════════════════════════════════════════════════════
 
 async def init_db() -> None:
@@ -192,6 +232,7 @@ async def init_db() -> None:
                 user_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER UNIQUE NOT NULL,
                 username TEXT,
+                coins INTEGER DEFAULT 0,
                 wood INTEGER DEFAULT 0,
                 stone INTEGER DEFAULT 0,
                 last_wood_gather TIMESTAMP,
@@ -223,6 +264,18 @@ async def init_db() -> None:
             )
         """)
         await db.commit()
+
+
+async def migrate_db() -> None:
+    """Применяет миграции к существующей базе данных."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Проверяем, есть ли колонка coins
+        cursor = await db.execute("PRAGMA table_info(users)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "coins" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN coins INTEGER DEFAULT 0")
+            await db.commit()
+            logger.info("Миграция: добавлена колонка coins в users")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -274,12 +327,23 @@ async def create_cabin(db: aiosqlite.Connection, user_id: int) -> None:
 
 
 async def update_user_resources(
-    db: aiosqlite.Connection, user_id: int, wood: int, stone: int
+    db: aiosqlite.Connection, user_id: int, coins: int, wood: int, stone: int
 ) -> None:
-    """Обновляет количество ресурсов в инвентаре пользователя."""
+    """Обновляет количество ресурсов и монет в инвентаре пользователя."""
     await db.execute(
-        "UPDATE users SET wood = ?, stone = ? WHERE user_id = ?",
-        (wood, stone, user_id),
+        "UPDATE users SET coins = ?, wood = ?, stone = ? WHERE user_id = ?",
+        (coins, wood, stone, user_id),
+    )
+    await db.commit()
+
+
+async def update_user_coins(
+    db: aiosqlite.Connection, user_id: int, coins: int
+) -> None:
+    """Обновляет только количество монет пользователя."""
+    await db.execute(
+        "UPDATE users SET coins = ? WHERE user_id = ?",
+        (coins, user_id),
     )
     await db.commit()
 
@@ -370,8 +434,72 @@ def main_menu() -> ReplyKeyboardMarkup:
             KeyboardButton(text=BTN_GATHER_WOOD),
             KeyboardButton(text=BTN_GATHER_STONE),
         ],
+        [
+            KeyboardButton(text=BTN_MARKET),
+        ],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def market_menu() -> InlineKeyboardMarkup:
+    """Возвращает меню рынка: покупка, продажа, назад."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💰 Продать", callback_data="market:sell"),
+                InlineKeyboardButton(text="🛒 Купить", callback_data="market:buy"),
+            ],
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="market:back"),
+            ],
+        ]
+    )
+
+
+def buy_menu() -> InlineKeyboardMarkup:
+    """Возвращает меню покупки товаров."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=BUY_WOOD_TEXT.format(price=PRICE_BUY_WOOD),
+                    callback_data="buy:wood:1",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUY_STONE_TEXT.format(price=PRICE_BUY_STONE),
+                    callback_data="buy:stone:1",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="market:back"),
+            ],
+        ]
+    )
+
+
+def sell_menu() -> InlineKeyboardMarkup:
+    """Возвращает меню продажи товаров."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=SELL_WOOD_TEXT.format(price=PRICE_SELL_WOOD),
+                    callback_data="sell:wood:1",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=SELL_STONE_TEXT.format(price=PRICE_SELL_STONE),
+                    callback_data="sell:stone:1",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="market:back"),
+            ],
+        ]
+    )
 
 
 def _build_game_kb(resource: str, target_idx: int) -> InlineKeyboardMarkup:
@@ -384,7 +512,6 @@ def _build_game_kb(resource: str, target_idx: int) -> InlineKeyboardMarkup:
         buttons.append(
             InlineKeyboardButton(text=text, callback_data=f"game:{resource}:{idx}")
         )
-    # Разбиваем на 3 ряда по 3
     keyboard = [buttons[i:i+3] for i in range(0, 9, 3)]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -393,7 +520,14 @@ def _build_game_kb(resource: str, target_idx: int) -> InlineKeyboardMarkup:
 # 6. СЕРВИСЫ — БИЗНЕС-ЛОГИКА
 # ═══════════════════════════════════════════════════════════════
 
-# ── 6.1 Добыча ресурсов — константы ──
+# ── 6.1 Рынок: цены (админские) ──
+
+PRICE_BUY_WOOD = 5    # 💰 за 1 🪵
+PRICE_SELL_WOOD = 3   # 💰 за 1 🪵
+PRICE_BUY_STONE = 10  # 💰 за 1 🪨
+PRICE_SELL_STONE = 6  # 💰 за 1 🪨
+
+# ── 6.2 Добыча ресурсов — константы ──
 
 WOOD_COOLDOWN = 30    # 30 секунд
 STONE_COOLDOWN = 60   # 1 минута
@@ -402,7 +536,7 @@ STONE_YIELD = 1       # за одно попадание
 GAME_HITS_NEEDED = 3  # попаданий подряд для успеха
 
 
-# ── 6.2 Хижина ──
+# ── 6.3 Хижина ──
 
 TICK_MINUTES = 10
 CONSUMPTION_PER_TICK_WOOD = 1
@@ -471,7 +605,7 @@ async def build_cabin(
     new_wood = user["wood"] - wood_needed
     new_stone = user["stone"] - stone_needed
 
-    await update_user_resources(db, user_id, new_wood, new_stone)
+    await update_user_resources(db, user_id, user["coins"], new_wood, new_stone)
     await create_cabin(db, user_id)
     return True, "success"
 
@@ -500,12 +634,12 @@ async def add_to_storage(
     new_user_wood = user["wood"] - actual_wood
     new_user_stone = user["stone"] - actual_stone
 
-    await update_user_resources(db, user_id, new_user_wood, new_user_stone)
+    await update_user_resources(db, user_id, user["coins"], new_user_wood, new_user_stone)
     await update_cabin_storage(db, user_id, new_wood_storage, new_stone_storage)
     return True, "success"
 
 
-# ── 6.3 Уведомления ──
+# ── 6.4 Уведомления ──
 
 CHECK_INTERVAL = 600   # 10 минут
 NOTIFY_COOLDOWN = 7200  # 2 часа между повторными уведомлениями
@@ -587,6 +721,7 @@ start_router = Router()
 inventory_router = Router()
 gathering_router = Router()
 cabin_router = Router()
+market_router = Router()
 
 
 # ── /start ──
@@ -607,15 +742,19 @@ async def cmd_start(message: Message) -> None:
         await message.answer(ERROR_GENERAL)
 
 
-# ── Инвентарь ──
+# ── Инвентарь (обновлён с монетами) ──
 
 @inventory_router.message(lambda msg: msg.text == BTN_INVENTORY)
 async def show_inventory(message: Message) -> None:
-    """Показывает текущее количество дерева и камня в инвентаре."""
+    """Показывает текущий инвентарь: монеты, дерево, камень."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             user = await get_or_create_user(db, message.from_user.id)
-            text = INVENTORY_TEXT.format(wood=user["wood"], stone=user["stone"])
+            text = INVENTORY_TEXT.format(
+                coins=user.get("coins", 0),
+                wood=user["wood"],
+                stone=user["stone"],
+            )
             await message.answer(text)
     except Exception:
         await message.answer(ERROR_GENERAL)
@@ -635,7 +774,6 @@ async def gather_wood_handler(message: Message, state: FSMContext) -> None:
         async with aiosqlite.connect(DB_PATH) as db:
             user = await get_or_create_user(db, message.from_user.id)
 
-            # Проверка кулдауна
             now = datetime.now()
             last = user.get("last_wood_gather")
             if last:
@@ -647,7 +785,6 @@ async def gather_wood_handler(message: Message, state: FSMContext) -> None:
                     )
                     return
 
-            # Запуск мини-игры
             target = random.randint(0, 8)
             kb = _build_game_kb("wood", target)
             sent = await message.answer(GATHER_WOOD_START, reply_markup=kb)
@@ -681,7 +818,6 @@ async def gather_stone_handler(message: Message, state: FSMContext) -> None:
         async with aiosqlite.connect(DB_PATH) as db:
             user = await get_or_create_user(db, message.from_user.id)
 
-            # Проверка кулдауна
             now = datetime.now()
             last = user.get("last_stone_gather")
             if last:
@@ -693,7 +829,6 @@ async def gather_stone_handler(message: Message, state: FSMContext) -> None:
                     )
                     return
 
-            # Запуск мини-игры
             target = random.randint(0, 8)
             kb = _build_game_kb("stone", target)
             sent = await message.answer(GATHER_STONE_START, reply_markup=kb)
@@ -732,7 +867,6 @@ async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
         resource = parts[1]
         idx = int(parts[2])
 
-        # Если callback не от текущей игры (wood vs stone)
         if data.get("resource") != resource:
             await call.answer("Это не твоя текущая игра.", show_alert=True)
             return
@@ -744,21 +878,23 @@ async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
         user_id = data["user_id"]
 
         if idx == target:
-            # ── Попадание ──
             hits += 1
             if hits >= GAME_HITS_NEEDED:
-                # Финиш: начисляем ресурсы и записываем кулдаун
                 amount = hits * (WOOD_YIELD if resource == "wood" else STONE_YIELD)
                 async with aiosqlite.connect(DB_PATH) as db:
                     user = await get_or_create_user(db, call.from_user.id)
                     if resource == "wood":
                         new_wood = user["wood"] + amount
-                        await update_user_resources(db, user_id, new_wood, user["stone"])
+                        await update_user_resources(
+                            db, user_id, user["coins"], new_wood, user["stone"]
+                        )
                         await update_gather_cooldown(db, user_id, "wood", datetime.now())
                         text = GATHER_WOOD_SUCCESS.format(amount=amount)
                     else:
                         new_stone = user["stone"] + amount
-                        await update_user_resources(db, user_id, user["wood"], new_stone)
+                        await update_user_resources(
+                            db, user_id, user["coins"], user["wood"], new_stone
+                        )
                         await update_gather_cooldown(db, user_id, "stone", datetime.now())
                         text = GATHER_STONE_SUCCESS.format(amount=amount)
 
@@ -772,7 +908,6 @@ async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
                 logger.info("Пользователь %s успешно завершил добычу %s (+ %s)",
                             call.from_user.id, resource, amount)
             else:
-                # Следующий раунд: новая цель, обновляем поле
                 new_target = random.randint(0, 8)
                 kb = _build_game_kb(resource, new_target)
                 hit_text = (
@@ -787,7 +922,6 @@ async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
                 await state.update_data(hits=hits, target=new_target)
                 await call.answer("✅ Попадание!")
         else:
-            # ── Промах ──
             async with aiosqlite.connect(DB_PATH) as db:
                 if resource == "wood":
                     await update_gather_cooldown(db, user_id, "wood", datetime.now())
@@ -806,6 +940,177 @@ async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
             logger.info("Пользователь %s промахнулся в добыче %s", call.from_user.id, resource)
             await call.answer("❌ Промах!", show_alert=True)
 
+    except Exception:
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# ── Рынок: вход ──
+
+@market_router.message(lambda msg: msg.text == BTN_MARKET)
+async def market_entry(message: Message) -> None:
+    """Открывает главное меню рынка."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            user = await get_or_create_user(db, message.from_user.id)
+            await message.answer(
+                MARKET_WELCOME,
+                reply_markup=market_menu(),
+            )
+    except Exception:
+        await message.answer(ERROR_GENERAL)
+
+
+# ── Рынок: покупка ──
+
+@market_router.callback_query(F.data == "market:buy")
+async def market_buy(call: CallbackQuery) -> None:
+    """Показывает меню покупки товаров."""
+    try:
+        await call.message.edit_text(
+            MARKET_BUY_HEADER,
+            reply_markup=buy_menu(),
+        )
+        await call.answer()
+    except Exception:
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# ── Рынок: продажа ──
+
+@market_router.callback_query(F.data == "market:sell")
+async def market_sell(call: CallbackQuery) -> None:
+    """Показывает меню продажи товаров."""
+    try:
+        await call.message.edit_text(
+            MARKET_SELL_HEADER,
+            reply_markup=sell_menu(),
+        )
+        await call.answer()
+    except Exception:
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# ── Рынок: назад в главное меню ──
+
+@market_router.callback_query(F.data == "market:back")
+async def market_back(call: CallbackQuery) -> None:
+    """Возвращает пользователя в главное меню рынка."""
+    try:
+        await call.message.edit_text(
+            MARKET_WELCOME,
+            reply_markup=market_menu(),
+        )
+        await call.answer()
+    except Exception:
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# ── Рынок: покупка товара ──
+
+@market_router.callback_query(F.data.startswith("buy:"))
+async def buy_item(call: CallbackQuery) -> None:
+    """Обрабатывает покупку ресурса у NPC-рынка."""
+    try:
+        parts = call.data.split(":")
+        if len(parts) != 3:
+            return
+        resource = parts[1]  # wood или stone
+        amount = int(parts[2])
+
+        price = PRICE_BUY_WOOD if resource == "wood" else PRICE_BUY_STONE
+        total_price = price * amount
+        emoji = "🪵" if resource == "wood" else "🪨"
+        res_name = "дерево" if resource == "wood" else "камень"
+        res_name_cap = "Дерево" if resource == "wood" else "Камень"
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            user = await get_or_create_user(db, call.from_user.id)
+            coins = user.get("coins", 0)
+
+            if coins < total_price:
+                await call.answer(
+                    BUY_NO_MONEY.format(price=total_price, coins=coins),
+                    show_alert=True,
+                )
+                return
+
+            new_coins = coins - total_price
+            new_wood = user["wood"] + (amount if resource == "wood" else 0)
+            new_stone = user["stone"] + (amount if resource == "stone" else 0)
+
+            await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
+
+            text = BUY_SUCCESS.format(
+                amount=amount,
+                resource=res_name,
+                price=total_price,
+                coins_before=coins,
+                coins_after=new_coins,
+                emoji=emoji,
+                resource_cap=res_name_cap,
+                res_before=user["wood"] if resource == "wood" else user["stone"],
+                res_after=new_wood if resource == "wood" else new_stone,
+            )
+
+        await call.message.edit_text(text, reply_markup=buy_menu())
+        await call.answer("✅ Куплено!")
+        logger.info("Пользователь %s купил %s %s за %s💰",
+                    call.from_user.id, amount, resource, total_price)
+    except Exception:
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# ── Рынок: продажа товара ──
+
+@market_router.callback_query(F.data.startswith("sell:"))
+async def sell_item(call: CallbackQuery) -> None:
+    """Обрабатывает продажу ресурса NPC-рынку."""
+    try:
+        parts = call.data.split(":")
+        if len(parts) != 3:
+            return
+        resource = parts[1]  # wood или stone
+        amount = int(parts[2])
+
+        price = PRICE_SELL_WOOD if resource == "wood" else PRICE_SELL_STONE
+        total_price = price * amount
+        emoji = "🪵" if resource == "wood" else "🪨"
+        res_name = "дерево" if resource == "wood" else "камень"
+        res_name_cap = "Дерево" if resource == "wood" else "Камень"
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            user = await get_or_create_user(db, call.from_user.id)
+            have = user["wood"] if resource == "wood" else user["stone"]
+
+            if have < amount:
+                await call.answer(
+                    SELL_NO_RESOURCES.format(amount=amount, resource=res_name, have=have),
+                    show_alert=True,
+                )
+                return
+
+            new_coins = user.get("coins", 0) + total_price
+            new_wood = user["wood"] - (amount if resource == "wood" else 0)
+            new_stone = user["stone"] - (amount if resource == "stone" else 0)
+
+            await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
+
+            text = SELL_SUCCESS.format(
+                amount=amount,
+                resource=res_name,
+                price=total_price,
+                coins_before=user.get("coins", 0),
+                coins_after=new_coins,
+                emoji=emoji,
+                resource_cap=res_name_cap,
+                res_before=have,
+                res_after=new_wood if resource == "wood" else new_stone,
+            )
+
+        await call.message.edit_text(text, reply_markup=sell_menu())
+        await call.answer("✅ Продано!")
+        logger.info("Пользователь %s продал %s %s за %s💰",
+                    call.from_user.id, amount, resource, total_price)
     except Exception:
         await call.answer(ERROR_GENERAL, show_alert=True)
 
@@ -944,8 +1249,9 @@ async def repair_cabin_callback(call: CallbackQuery) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 async def main() -> None:
-    """Главная корутина: подготовка БД и запуск polling."""
+    """Главная корутина: подготовка БД, миграции и запуск polling."""
     await init_db()
+    await migrate_db()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
@@ -955,6 +1261,7 @@ async def main() -> None:
         inventory_router,
         gathering_router,
         cabin_router,
+        market_router,
     )
 
     # Фоновый цикл уведомлений о низких ресурсах
