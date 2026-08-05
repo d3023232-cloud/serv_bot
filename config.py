@@ -21,9 +21,9 @@ elif not DB_PATH:
     DB_PATH = "survival_bot.db"
 
 # ── Рынок: цены ──
-PRICE_BUY_WOOD = 5
+PRICE_BUY_WOOD = 5  # дерево
 PRICE_SELL_WOOD = 3
-PRICE_BUY_STONE = 10
+PRICE_BUY_STONE = 10  # камень
 PRICE_SELL_STONE = 6
 
 # ── Добыча ──
@@ -40,11 +40,11 @@ CONSUMPTION_PER_TICK_STONE = 1
 DECAY_FAST_PER_TICK = 12.0   # гниение без ресурсов (% за тик)
 
 # ── Починка ──
-REPAIR_WOOD_PER_HP = 10
-REPAIR_STONE_PER_HP = 5
+REPAIR_WOOD_PER_HP = 6
+REPAIR_STONE_PER_HP = 3
 
 # ── Восстановление за Stars ──
-RESTORE_STARS_PRICE = 29
+RESTORE_STARS_PRICE = 14
 
 # ── Уведомления ──
 CHECK_INTERVAL = 600           # сек между проверками фонового цикла
