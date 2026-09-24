@@ -4,7 +4,7 @@
 
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone  # FIXED (Задача 2): единое UTC-время
 from typing import Optional
 
 import aiosqlite
@@ -35,6 +35,8 @@ from database import (
     get_fifty_percent_flag,
     set_fifty_percent_flag,
     reset_fifty_percent_flag,
+    get_empty_notify_stage,  # FIXED (уведомления): стадия из 3 пустых уведомлений
+    set_empty_notify_stage,
     update_cabin_durability,
     update_cabin_storage,
     delete_cabin,
@@ -48,7 +50,7 @@ async def apply_cabin_tick(
 ) -> Optional[dict]:
     """Применяет потребление/гниение хижины за всё прошедшее время."""
     if now is None:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)  # FIXED (Задача 2): UTC вместо локального времени
 
     cabin = await get_cabin(db, user_id)
     if not cabin or not cabin["is_built"]:
@@ -58,9 +60,15 @@ async def apply_cabin_tick(
     if last_raw is None:
         last_check = now
     elif isinstance(last_raw, str):
+        # FIXED (Задача 2): старые метки SQLite — naive строки в UTC;
+        # проставляем tzinfo=utc, иначе aware/naive вычитание упадёт TypeError.
         last_check = datetime.fromisoformat(last_raw)
+        if last_check.tzinfo is None:
+            last_check = last_check.replace(tzinfo=timezone.utc)
     else:
         last_check = last_raw
+        if last_check.tzinfo is None:  # fallback на случай naive-объекта из БД
+            last_check = last_check.replace(tzinfo=timezone.utc)
 
     minutes_passed = (now - last_check).total_seconds() / 60
     ticks = int(minutes_passed / TICK_MINUTES)
@@ -178,7 +186,7 @@ async def do_repair(
     await update_user_resources(
         db, user_id, user["coins"], user["wood"] - cost_wood, user["stone"] - cost_stone
     )
-    await update_cabin_durability(db, user_id, new_dur, datetime.now())
+    await update_cabin_durability(db, user_id, new_dur, datetime.now(timezone.utc))  # FIXED (Задача 2): UTC
 
     return True, "success", {
         "hp": hp,
@@ -200,8 +208,9 @@ async def start_notification_loop(bot: Bot) -> None:
     while True:
         try:
             await check_and_notify(bot)
-        except Exception as exc:
-            logger.error("Ошибка в цикле уведомлений: %s", exc)
+        except Exception:
+            # FIXED (Задача 6): logger.exception вместо logger.error(exc) — с трейсбеком
+            logger.exception("Ошибка в цикле уведомлений")
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -209,7 +218,7 @@ async def check_and_notify(bot: Bot) -> None:
     """Проверяет все хижины и шлёт push."""
     async with aiosqlite.connect(DB_PATH) as db:
         cabins = await get_all_cabins(db)
-        now = datetime.now()
+        now = datetime.now(timezone.utc)  # FIXED (Задача 2): UTC вместо локального времени
 
         for cabin in cabins:
             user_id = cabin["user_id"]
@@ -223,11 +232,26 @@ async def check_and_notify(bot: Bot) -> None:
             max_stone = cabin["max_stone_storage"]
             durability = cabin["durability"]
 
+            # FIXED (Задача 3): кулдаун пустых уведомлений считаем заранее,
+            # чтобы ветка разрушения (durability <= 0) выполнялась ВСЕГДА —
+            # раньше `continue` внутри проверки кулдауна пропускал её до 30 минут.
+            empty_cooldown_ok = True
+            if wood == 0 or stone == 0:
+                last_notify = await get_notification_state(db, user_id)
+                # FIXED (Задача 3): last_notify может быть None — трактуем как «кулдаун прошёл»
+                if last_notify is not None and (now - last_notify).total_seconds() < NOTIFY_EMPTY_COOLDOWN:
+                    empty_cooldown_ok = False
+
             # Проверка 50% — один раз, сбрасывается при пополнении обоих >= 50%
             fifty_flag = await get_fifty_percent_flag(db, user_id)
             if wood >= max_wood * THRESHOLD_FIFTY and stone >= max_stone * THRESHOLD_FIFTY:
                 if fifty_flag:
                     await reset_fifty_percent_flag(db, user_id)
+                # FIXED (уведомления): шкаф пополнен (оба ресурса >= 50%) —
+                # сбрасываем стадию пустых уведомлений, чтобы следующий цикл
+                # разрушения снова получил свои 3 предупреждения.
+                if await get_empty_notify_stage(db, user_id) != 0:
+                    await set_empty_notify_stage(db, user_id, 0)
             else:
                 if not fifty_flag:
                     cursor = await db.execute(
@@ -245,37 +269,55 @@ async def check_and_notify(bot: Bot) -> None:
                             )
                             await set_fifty_percent_flag(db, user_id, 1)
                             logger.info("50%% уведомление отправлено %s", telegram_id)
-                        except Exception as exc:
-                            logger.warning("Не удалось отправить 50%% %s: %s", telegram_id, exc)
+                        except Exception:
+                            # FIXED (Задача 6): трейсбек вместо голого warning-сообщения
+                            logger.exception("Не удалось отправить 50%% уведомление %s", telegram_id)
 
-            # Проверка 0 ресурсов — каждые 30 мин
-            if wood == 0 or stone == 0:
-                last_notify = await get_notification_state(db, user_id)
-                if last_notify:
-                    if (now - last_notify).total_seconds() < NOTIFY_EMPTY_COOLDOWN:
-                        continue
+            # FIXED (уведомления): пустое уведомление теперь НЕ повторяется каждые
+            # 30 минут. Максимум 3 уведомления за цикл разрушения — при прочности
+            # <90%, <40% и <=10%. Стадия (0..3) хранится в БД; в тексте показывается
+            # остаток процентов до полного разрушения хижины. Кулдаун NOTIFY_EMPTY_COOLDOWN
+            # оставлен как защита от дублей внутри одного тика.
+            if (wood == 0 or stone == 0) and empty_cooldown_ok:
+                stage = await get_empty_notify_stage(db, user_id)
+                if stage == 0 and durability < 90:
+                    new_stage = 1
+                elif stage == 1 and durability < 40:
+                    new_stage = 2
+                elif stage == 2 and durability <= 10:
+                    new_stage = 3
+                else:
+                    new_stage = None  # все 3 уведомления уже отправлены
 
-                cursor = await db.execute(
-                    "SELECT telegram_id FROM users WHERE user_id = ?", (user_id,)
-                )
-                row = await cursor.fetchone()
-                if not row:
-                    continue
-                telegram_id = row[0]
-
-                try:
-                    await bot.send_message(
-                        chat_id=telegram_id,
-                        text=NOTIFY_EMPTY_RESOURCES.format(
-                            wood=wood, max_wood=max_wood, stone=stone, max_stone=max_stone
-                        ),
+                if new_stage is not None:
+                    cursor = await db.execute(
+                        "SELECT telegram_id FROM users WHERE user_id = ?", (user_id,)
                     )
-                    await set_notification_state(db, user_id, now)
-                    logger.info("Пустое уведомление отправлено %s", telegram_id)
-                except Exception as exc:
-                    logger.warning("Не удалось отправить пустое %s: %s", telegram_id, exc)
+                    row = await cursor.fetchone()
+                    if row:
+                        telegram_id = row[0]
 
-            # Проверка разрушения хижины
+                        try:
+                            await bot.send_message(
+                                chat_id=telegram_id,
+                                text=NOTIFY_EMPTY_RESOURCES.format(
+                                    wood=wood, max_wood=max_wood,
+                                    stone=stone, max_stone=max_stone,
+                                    durability=int(durability),
+                                ),
+                            )
+                            await set_notification_state(db, user_id, now)
+                            await set_empty_notify_stage(db, user_id, new_stage)
+                            logger.info(
+                                "Пустое уведомление (стадия %d/3) отправлено %s",
+                                new_stage, telegram_id,
+                            )
+                        except Exception:
+                            # FIXED (Задача 6): трейсбек вместо голого warning-сообщения
+                            logger.exception("Не удалось отправить пустое уведомление %s", telegram_id)
+
+            # Проверка разрушения хижины — всегда, независимо от кулдаунов выше
+            # (FIXED (Задача 3): убран ранний continue, блок больше не пропускается)
             if durability <= 0:
                 cursor = await db.execute(
                     "SELECT telegram_id FROM users WHERE user_id = ?", (user_id,)
@@ -306,6 +348,7 @@ async def check_and_notify(bot: Bot) -> None:
                             reply_markup=kb,
                         )
                         logger.info("Уведомление о разрушении отправлено %s", telegram_id)
-                    except Exception as exc:
-                        logger.warning("Не удалось отправить разрушение %s: %s", telegram_id, exc)
+                    except Exception:
+                        # FIXED (Задача 6): трейсбек вместо голого warning-сообщения
+                        logger.exception("Не удалось отправить уведомление о разрушении %s", telegram_id)
                 await destroy_cabin(db, user_id)

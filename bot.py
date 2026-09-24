@@ -25,7 +25,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _validate_token_or_exit(token: str) -> None:
+    """Понятная ошибка вместо краша aiogram с нечитаемым трейсбеком."""
+    if not token:
+        raise SystemExit(
+            "Ошибка: переменная окружения BOT_TOKEN не задана. "
+            "Укажите токен бота в настройках хостинга (получить можно у @BotFather)."
+        )
+    if ":" not in token or not token.split(":", 1)[0].isdigit():
+        raise SystemExit(
+            f"Ошибка: BOT_TOKEN имеет неверный формат: {token!r}. "
+            "Ожидается значение вида '123456789:ABCdefGHI...'. "
+            "Скопируйте токен целиком из @BotFather и вставьте без кавычек и лишнего текста."
+        )
+
+
 async def main() -> None:
+    _validate_token_or_exit(BOT_TOKEN)
+
     await init_db()
     await migrate_db()
 

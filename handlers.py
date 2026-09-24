@@ -4,7 +4,9 @@
 
 import random
 import logging
-from datetime import datetime
+import sys  # FIXED (Задача 6): для имени хендлера в логах исключений
+from datetime import datetime, timezone  # FIXED (Задача 2): единое UTC-время
+from typing import Optional
 
 from aiogram import Router, F, Bot
 from aiogram.types import (
@@ -27,27 +29,21 @@ from config import (
     WELCOME_BACK,
     BTN_MY_CABIN,
     BTN_INVENTORY,
-    BTN_GATHER_WOOD,
-    BTN_GATHER_STONE,
+    BTN_GATHER,  # FIXED (реплей кнопок добычи): одна кнопка вместо двух
     BTN_MARKET,
     CABIN_NOT_BUILT,
     CABIN_STATUS,
     INVENTORY_TEXT,
-    GATHER_WOOD_START,
-    GATHER_WOOD_HIT,
+    # NEW (добыча): тексты меню выбора места добычи и мгновенной добычи
+    GATHER_MENU_TEXT,
+    GATHER_SAND_SUCCESS,
     GATHER_WOOD_SUCCESS,
-    GATHER_WOOD_MISS,
-    GATHER_WOOD_COOLDOWN,
-    GATHER_WOOD_ALREADY,
-    GATHER_STONE_START,
-    GATHER_STONE_HIT,
     GATHER_STONE_SUCCESS,
-    GATHER_STONE_MISS,
-    GATHER_STONE_COOLDOWN,
-    GATHER_STONE_ALREADY,
+    GATHER_COOLDOWN,
     MARKET_WELCOME,
     MARKET_BUY_HEADER,
     MARKET_SELL_HEADER,
+    BUY_SAND_TEXT,  # NEW (песок): товар рынка
     BUY_WOOD_TEXT,
     BUY_STONE_TEXT,
     SELL_WOOD_TEXT,
@@ -70,11 +66,13 @@ from config import (
     PRICE_SELL_WOOD,
     PRICE_BUY_STONE,
     PRICE_SELL_STONE,
+    SAND_PRICE,  # NEW (песок): цена покупки на рынке
     WOOD_COOLDOWN,
     STONE_COOLDOWN,
-    WOOD_YIELD,
-    STONE_YIELD,
-    GAME_HITS_NEEDED,
+    SAND_COOLDOWN,  # NEW (добыча): кулдауны и максимумы за заход
+    MAX_SAND_PER_RUN,
+    MAX_WOOD_PER_RUN,
+    MAX_STONE_PER_RUN,
     RESTORE_STARS_PRICE,
 )
 from database import (
@@ -95,10 +93,35 @@ from services import (
 
 logger = logging.getLogger(__name__)
 
-# ── FSM ──
-class GatherGame(StatesGroup):
-    playing = State()
 
+def _current_handler_name() -> str:
+    """Имя хендлера, в котором произошёл exception (для логов, Задача 6)."""
+    frame = sys.exc_info()[2]
+    if frame is None:
+        return "?"
+    while frame.tb_next:
+        frame = frame.tb_next
+    return frame.tb_frame.f_code.co_name
+
+
+def _parse_ts(raw) -> Optional[datetime]:
+    """Парсит таймстемп из БД в aware UTC datetime.
+
+    FIXED (Задача 2): старые строки SQLite ("YYYY-MM-DD HH:MM:SS") — это UTC без
+    таймзоны; приравниваем tzinfo=utc, чтобы корректно сравнивать с
+    datetime.now(timezone.utc). Миграция в migrate_db() приводит их к ISO+00:00,
+    но fallback оставлен на случай пропуска миграции.
+    """
+    if raw is None:
+        return None
+    dt = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+# ── FSM ──
+# FIXED (реплей кнопок добычи): мини-игра «найди предмет» заменена мгновенной
+# добычей по инлайн-кнопке — состояние GatherGame больше не нужно.
 class MarketState(StatesGroup):
     entering_amount = State()
 
@@ -110,7 +133,9 @@ class RepairState(StatesGroup):
 def main_menu() -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton(text=BTN_MY_CABIN), KeyboardButton(text=BTN_INVENTORY)],
-        [KeyboardButton(text=BTN_GATHER_WOOD), KeyboardButton(text=BTN_GATHER_STONE)],
+        # FIXED (реплей кнопок добычи): вместо двух реплей-кнопок дерева/камня —
+        # одна «⛏ Добыча», внутри неё инлайн-выбор места добычи.
+        [KeyboardButton(text=BTN_GATHER)],
         [KeyboardButton(text=BTN_MARKET)],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
@@ -131,6 +156,7 @@ def market_menu() -> InlineKeyboardMarkup:
 def buy_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text=BUY_SAND_TEXT, callback_data="buy:sand")],  # NEW (песок)
             [InlineKeyboardButton(text=BUY_WOOD_TEXT, callback_data="buy:wood")],
             [InlineKeyboardButton(text=BUY_STONE_TEXT, callback_data="buy:stone")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="market:back")],
@@ -156,17 +182,44 @@ def cancel_kb() -> InlineKeyboardMarkup:
     )
 
 
-def _build_game_kb(resource: str, target_idx: int) -> InlineKeyboardMarkup:
-    emoji_target = "🪵" if resource == "wood" else "🪨"
-    emoji_empty = "🌿" if resource == "wood" else "⬜"
-    buttons = []
-    for idx in range(9):
-        text = emoji_target if idx == target_idx else emoji_empty
-        buttons.append(
-            InlineKeyboardButton(text=text, callback_data=f"game:{resource}:{idx}")
-        )
-    keyboard = [buttons[i:i+3] for i in range(0, 9, 3)]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+# NEW (добыча): справочник параметров мест добычи (иерархия: песок → дерево → камень)
+GATHER_RESOURCES = {
+    "sand": {
+        "emoji": "🏖", "name": "Песок", "place": "Пляж",
+        "cooldown": SAND_COOLDOWN, "max_per_run": MAX_SAND_PER_RUN,
+        "success_text": GATHER_SAND_SUCCESS,
+        "column": "last_sand_gather",
+    },
+    "wood": {
+        "emoji": "🪵", "name": "Дерево", "place": "Лес",
+        "cooldown": WOOD_COOLDOWN, "max_per_run": MAX_WOOD_PER_RUN,
+        "success_text": GATHER_WOOD_SUCCESS,
+        "column": "last_wood_gather",
+    },
+    "stone": {
+        "emoji": "🪨", "name": "Камень", "place": "Каменоломня",
+        "cooldown": STONE_COOLDOWN, "max_per_run": MAX_STONE_PER_RUN,
+        "success_text": GATHER_STONE_SUCCESS,
+        "column": "last_stone_gather",
+    },
+}
+
+
+def gather_menu_kb() -> InlineKeyboardMarkup:
+    """NEW (добыча): инлайн-выбор места добычи (вместо реплей-кнопок)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"🏖 Пляж 🏖 (до {MAX_SAND_PER_RUN}, кд {SAND_COOLDOWN}с)",
+                callback_data="gather:sand")],
+            [InlineKeyboardButton(
+                text=f"🌲 Лес 🪵 (до {MAX_WOOD_PER_RUN}, кд {WOOD_COOLDOWN}с)",
+                callback_data="gather:wood")],
+            [InlineKeyboardButton(
+                text=f"⛰ Каменоломня 🪨 (до {MAX_STONE_PER_RUN}, кд {STONE_COOLDOWN}с)",
+                callback_data="gather:stone")],
+        ]
+    )
 
 
 # ── Роутеры ──
@@ -179,160 +232,127 @@ market_router = Router()
 
 # ── /start ──
 @start_router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
     try:
+        # FIXED (Задача 4): сбрасываем зависшее FSM-состояние при /start
+        await state.clear()
         async with aiosqlite.connect(DB_PATH) as db:
             user = await get_or_create_user(db, message.from_user.id, message.from_user.username)
             cabin = await get_cabin(db, user["user_id"])
             text = WELCOME_BACK if (cabin and cabin["is_built"]) else WELCOME_NEW
             await message.answer(text, reply_markup=main_menu())
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
 
 
 # ── Инвентарь ──
 @inventory_router.message(lambda msg: msg.text == BTN_INVENTORY)
-async def show_inventory(message: Message) -> None:
+async def show_inventory(message: Message, state: FSMContext) -> None:
     try:
+        # FIXED (Задача 4): кнопка главного меню — сбрасываем FSM, иначе
+        # следующее сообщение юзера парсилось бы как число рынка/починки
+        await state.clear()
         async with aiosqlite.connect(DB_PATH) as db:
             user = await get_or_create_user(db, message.from_user.id)
             text = INVENTORY_TEXT.format(
-                coins=user.get("coins", 0), wood=user["wood"], stone=user["stone"]
+                coins=user.get("coins", 0),
+                sand=user.get("sand", 0),  # NEW (песок)
+                wood=user["wood"], stone=user["stone"],
             )
             await message.answer(text)
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
 
 
-# ── Мини-игра: Дерево ──
-@gathering_router.message(lambda msg: msg.text == BTN_GATHER_WOOD)
-async def gather_wood_handler(message: Message, state: FSMContext) -> None:
+# ── Добыча (NEW: реплей-кнопка «⛏ Добыча» + инлайн-выбор места добычи) ──
+@gathering_router.message(lambda msg: msg.text == BTN_GATHER)
+async def gather_menu_handler(message: Message, state: FSMContext) -> None:
+    """Показывает текст «Выбери место добычи» и инлайн-кнопки ресурсов."""
     try:
-        if await state.get_state() == GatherGame.playing:
-            await message.answer(GATHER_WOOD_ALREADY)
-            return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            user = await get_or_create_user(db, message.from_user.id)
-            now = datetime.now()
-            last = user.get("last_wood_gather")
-            if last:
-                last_dt = datetime.fromisoformat(last) if isinstance(last, str) else last
-                diff = (now - last_dt).total_seconds()
-                if diff < WOOD_COOLDOWN:
-                    await message.answer(GATHER_WOOD_COOLDOWN.format(seconds=int(WOOD_COOLDOWN - diff)))
-                    return
-
-            target = random.randint(0, 8)
-            kb = _build_game_kb("wood", target)
-            sent = await message.answer(GATHER_WOOD_START, reply_markup=kb)
-            await state.set_state(GatherGame.playing)
-            await state.update_data(
-                resource="wood", hits=0, target=target,
-                msg_id=sent.message_id, chat_id=message.chat.id,
-                user_id=user["user_id"], wood=user["wood"], stone=user["stone"],
-            )
+        # FIXED (Задача 4): кнопка главного меню — сбрасываем зависшее FSM
+        await state.clear()
+        text = GATHER_MENU_TEXT.format(
+            sand_max=MAX_SAND_PER_RUN, sand_cd=SAND_COOLDOWN,
+            wood_max=MAX_WOOD_PER_RUN, wood_cd=WOOD_COOLDOWN,
+            stone_max=MAX_STONE_PER_RUN, stone_cd=STONE_COOLDOWN,
+        )
+        await message.answer(text, reply_markup=gather_menu_kb())
     except Exception:
+        # FIXED (Задача 6): логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
 
 
-# ── Мини-игра: Камень ──
-@gathering_router.message(lambda msg: msg.text == BTN_GATHER_STONE)
-async def gather_stone_handler(message: Message, state: FSMContext) -> None:
+async def _finish_gather(call: CallbackQuery, bot: Bot, resource: str) -> None:
+    """NEW (добыча): мгновенная добыча вместо мини-игры.
+
+    Проверяет кулдаун, выдаёт случайное количество от 1 до максимума заход,
+    ставит кулдаун. Кулдаун ставится в момент добычи — «зависшей» игры больше
+    нет, поэтому проблема брошенной мини-игры (Задача 5) решается сама собой.
+    """
+    info = GATHER_RESOURCES[resource]
+    async with aiosqlite.connect(DB_PATH) as db:
+        user = await get_or_create_user(db, call.from_user.id)
+        now = datetime.now(timezone.utc)  # FIXED (Задача 2): единое UTC
+        last = _parse_ts(user.get(info["column"]))
+        if last:
+            diff = (now - last).total_seconds()
+            if diff < info["cooldown"]:
+                await call.answer(
+                    GATHER_COOLDOWN.format(
+                        emoji=info["emoji"], resource=info["name"].lower(),
+                        seconds=int(info["cooldown"] - diff),
+                    ).replace("<b>", "").replace("</b>", ""),
+                    show_alert=True,
+                )
+                return
+
+        amount = random.randint(1, info["max_per_run"])
+        new_coins = user.get("coins", 0)
+        new_wood = user["wood"] + (amount if resource == "wood" else 0)
+        new_stone = user["stone"] + (amount if resource == "stone" else 0)
+        new_sand = user.get("sand", 0) + (amount if resource == "sand" else 0)
+        await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone, new_sand)
+        await update_gather_cooldown(db, user["user_id"], resource, now)
+
+    text = info["success_text"].format(amount=amount, cooldown=info["cooldown"])
+    await bot.edit_message_text(
+        chat_id=call.message.chat.id, message_id=call.message.message_id,
+        text=text, reply_markup=None,
+    )
+    await call.answer(f"✅ +{amount} {info['name'].lower()}!")
+
+
+@gathering_router.callback_query(F.data.startswith("gather:"))
+async def gather_start_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Обработчик инлайн-кнопок выбора места добычи."""
     try:
-        if await state.get_state() == GatherGame.playing:
-            await message.answer(GATHER_STONE_ALREADY)
+        resource = call.data.split(":")[1]
+        if resource not in GATHER_RESOURCES:
+            await call.answer()
             return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            user = await get_or_create_user(db, message.from_user.id)
-            now = datetime.now()
-            last = user.get("last_stone_gather")
-            if last:
-                last_dt = datetime.fromisoformat(last) if isinstance(last, str) else last
-                diff = (now - last_dt).total_seconds()
-                if diff < STONE_COOLDOWN:
-                    await message.answer(GATHER_STONE_COOLDOWN.format(seconds=int(STONE_COOLDOWN - diff)))
-                    return
-
-            target = random.randint(0, 8)
-            kb = _build_game_kb("stone", target)
-            sent = await message.answer(GATHER_STONE_START, reply_markup=kb)
-            await state.set_state(GatherGame.playing)
-            await state.update_data(
-                resource="stone", hits=0, target=target,
-                msg_id=sent.message_id, chat_id=message.chat.id,
-                user_id=user["user_id"], wood=user["wood"], stone=user["stone"],
-            )
+        await _finish_gather(call, bot, resource)
     except Exception:
-        await message.answer(ERROR_GENERAL)
-
-
-# ── Обработка кликов в мини-игре ──
-@gathering_router.callback_query(F.data.startswith("game:"))
-async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    try:
-        if await state.get_state() != GatherGame.playing:
-            await call.answer("Игра уже завершена.", show_alert=True)
-            return
-
-        data = await state.get_data()
-        parts = call.data.split(":")
-        if len(parts) != 3:
-            return
-
-        resource = parts[1]
-        idx = int(parts[2])
-
-        if data.get("resource") != resource:
-            await call.answer("Это не твоя текущая игра.", show_alert=True)
-            return
-
-        target = data["target"]
-        hits = data["hits"]
-        msg_id = data["msg_id"]
-        chat_id = data["chat_id"]
-        user_id = data["user_id"]
-
-        if idx == target:
-            hits += 1
-            if hits >= GAME_HITS_NEEDED:
-                amount = hits * (WOOD_YIELD if resource == "wood" else STONE_YIELD)
-                async with aiosqlite.connect(DB_PATH) as db:
-                    user = await get_or_create_user(db, call.from_user.id)
-                    if resource == "wood":
-                        new_wood = user["wood"] + amount
-                        await update_user_resources(db, user_id, user["coins"], new_wood, user["stone"])
-                        await update_gather_cooldown(db, user_id, "wood", datetime.now())
-                        text = GATHER_WOOD_SUCCESS.format(amount=amount)
-                    else:
-                        new_stone = user["stone"] + amount
-                        await update_user_resources(db, user_id, user["coins"], user["wood"], new_stone)
-                        await update_gather_cooldown(db, user_id, "stone", datetime.now())
-                        text = GATHER_STONE_SUCCESS.format(amount=amount)
-
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=None)
-                await state.clear()
-            else:
-                new_target = random.randint(0, 8)
-                kb = _build_game_kb(resource, new_target)
-                hit_text = (GATHER_WOOD_HIT if resource == "wood" else GATHER_STONE_HIT).format(hits=hits)
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=hit_text, reply_markup=kb)
-                await state.update_data(hits=hits, target=new_target)
-                await call.answer("✅ Попадание!")
-        else:
-            async with aiosqlite.connect(DB_PATH) as db:
-                if resource == "wood":
-                    await update_gather_cooldown(db, user_id, "wood", datetime.now())
-                    text = GATHER_WOOD_MISS
-                else:
-                    await update_gather_cooldown(db, user_id, "stone", datetime.now())
-                    text = GATHER_STONE_MISS
-
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=None)
-            await state.clear()
-            await call.answer("❌ Промах!", show_alert=True)
-    except Exception:
+        # FIXED (Задача 6): логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -341,10 +361,18 @@ async def game_callback(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
 # ═══════════════════════════════════════════════════════════════
 
 @market_router.message(lambda msg: msg.text == BTN_MARKET)
-async def market_entry(message: Message) -> None:
+async def market_entry(message: Message, state: FSMContext) -> None:
     try:
+        # FIXED (Задача 4): кнопка главного меню — сбрасываем зависшее FSM,
+        # иначе следующее сообщение юзера парсилось бы как число рынка
+        await state.clear()
         await message.answer(MARKET_WELCOME, reply_markup=market_menu())
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
 
 
@@ -354,6 +382,13 @@ async def market_buy(call: CallbackQuery) -> None:
         await call.message.edit_text(MARKET_BUY_HEADER, reply_markup=buy_menu())
         await call.answer()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -363,6 +398,13 @@ async def market_sell(call: CallbackQuery) -> None:
         await call.message.edit_text(MARKET_SELL_HEADER, reply_markup=sell_menu())
         await call.answer()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -373,6 +415,13 @@ async def market_back(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.edit_text(MARKET_WELCOME, reply_markup=market_menu())
         await call.answer()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -380,9 +429,16 @@ async def market_back(call: CallbackQuery, state: FSMContext) -> None:
 async def buy_select(call: CallbackQuery, state: FSMContext) -> None:
     try:
         resource = call.data.split(":")[1]
-        price = PRICE_BUY_WOOD if resource == "wood" else PRICE_BUY_STONE
-        emoji = "🪵" if resource == "wood" else "🪨"
-        res_name = "дерево" if resource == "wood" else "камень"
+        # NEW (песок): карта товаров вместо тернарников (было только wood/stone)
+        _buy_info = {
+            "sand": (SAND_PRICE, "🏖", "песок"),
+            "wood": (PRICE_BUY_WOOD, "🪵", "дерево"),
+            "stone": (PRICE_BUY_STONE, "🪨", "камень"),
+        }
+        if resource not in _buy_info:
+            await call.answer()
+            return
+        price, emoji, res_name = _buy_info[resource]
 
         text = MARKET_ENTER_AMOUNT.format(
             mode_emoji="🛒", mode="ПОКУПКА", emoji=emoji,
@@ -396,6 +452,13 @@ async def buy_select(call: CallbackQuery, state: FSMContext) -> None:
         )
         await call.answer()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -419,6 +482,13 @@ async def sell_select(call: CallbackQuery, state: FSMContext) -> None:
         )
         await call.answer()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -429,6 +499,13 @@ async def market_cancel(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.edit_text(MARKET_WELCOME, reply_markup=market_menu())
         await call.answer("Отменено")
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -455,9 +532,13 @@ async def market_process_amount(message: Message, state: FSMContext, bot: Bot) -
             return
 
         total = price * amount
-        emoji = "🪵" if resource == "wood" else "🪨"
-        res_name = "дерево" if resource == "wood" else "камень"
-        res_name_cap = "Дерево" if resource == "wood" else "Камень"
+        # NEW (песок): справочник названий/эмодзи для сообщений рынка
+        _res_meta = {
+            "sand": ("🏖", "песок", "Песок"),
+            "wood": ("🪵", "дерево", "Дерево"),
+            "stone": ("🪨", "камень", "Камень"),
+        }
+        emoji, res_name, res_name_cap = _res_meta[resource]
 
         async with aiosqlite.connect(DB_PATH) as db:
             user = await get_or_create_user(db, message.from_user.id)
@@ -477,19 +558,25 @@ async def market_process_amount(message: Message, state: FSMContext, bot: Bot) -
                 new_coins = coins - total
                 new_wood = user["wood"] + (amount if resource == "wood" else 0)
                 new_stone = user["stone"] + (amount if resource == "stone" else 0)
-                await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
+                # NEW (песок): песок тоже можно купить — обновляем и его колонку
+                new_sand = user.get("sand", 0) + (amount if resource == "sand" else 0)
+                await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone, new_sand)
 
+                _before = {"sand": user.get("sand", 0), "wood": user["wood"], "stone": user["stone"]}[resource]
+                _after = {"sand": new_sand, "wood": new_wood, "stone": new_stone}[resource]
                 text = BUY_SUCCESS.format(
                     amount=amount, resource=res_name, total=total,
                     coins_before=coins, coins_after=new_coins, emoji=emoji,
                     resource_cap=res_name_cap,
-                    res_before=user["wood"] if resource == "wood" else user["stone"],
-                    res_after=new_wood if resource == "wood" else new_stone,
+                    res_before=_before,
+                    res_after=_after,
                 )
                 await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=buy_menu())
 
             else:
-                have = user["wood"] if resource == "wood" else user["stone"]
+                # NOTE (песок): продажа песка пока не добавлена в меню sell_menu,
+                # поэтому сюда попадают только wood/stone; .get("sand", 0) — на будущее.
+                have = {"sand": user.get("sand", 0), "wood": user["wood"], "stone": user["stone"]}[resource]
                 if have < amount:
                     await message.delete()
                     await bot.edit_message_text(
@@ -517,6 +604,11 @@ async def market_process_amount(message: Message, state: FSMContext, bot: Bot) -
         await state.clear()
         await message.delete()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
         await state.clear()
 
@@ -574,11 +666,19 @@ async def _show_cabin_status(
 
 
 @cabin_router.message(lambda msg: msg.text == BTN_MY_CABIN)
-async def my_cabin(message: Message) -> None:
+async def my_cabin(message: Message, state: FSMContext) -> None:
     try:
+        # FIXED (Задача 4): кнопка главного меню — сбрасываем зависшее FSM
+        # (MarketState.entering_amount / RepairState.entering_hp)
+        await state.clear()
         async with aiosqlite.connect(DB_PATH) as db:
             await _show_cabin_status(db, message.from_user.id, message)
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
 
 
@@ -596,6 +696,13 @@ async def build_cabin_callback(call: CallbackQuery) -> None:
                     show_alert=True,
                 )
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -611,6 +718,13 @@ async def add_wood_callback(call: CallbackQuery) -> None:
             else:
                 await call.answer("❌ Недостаточно дерева или нет хижины!", show_alert=True)
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -626,6 +740,13 @@ async def add_stone_callback(call: CallbackQuery) -> None:
             else:
                 await call.answer("❌ Недостаточно камня или нет хижины!", show_alert=True)
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -678,6 +799,13 @@ async def repair_cabin_callback(call: CallbackQuery, state: FSMContext) -> None:
             )
             await call.answer()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -689,6 +817,13 @@ async def repair_cancel_callback(call: CallbackQuery, state: FSMContext) -> None
             await _show_cabin_status(db, call.from_user.id, call.message, edit=True)
         await call.answer("Отменено")
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -721,6 +856,13 @@ async def repair_max_callback(call: CallbackQuery, state: FSMContext) -> None:
                 await call.answer("❌ Ошибка починки!", show_alert=True)
         await state.clear()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
         await state.clear()
 
@@ -783,6 +925,11 @@ async def repair_process_hp(message: Message, state: FSMContext, bot: Bot) -> No
         await state.clear()
         await message.delete()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
         await state.clear()
 
@@ -809,6 +956,13 @@ async def restore_cabin_callback(call: CallbackQuery) -> None:
         )
         await call.answer()
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -818,6 +972,13 @@ async def skip_restore_callback(call: CallbackQuery) -> None:
         await call.message.delete()
         await call.answer("Хижина потеряна. Чтобы построить новую, нужно 20🪵 и 10🪨.")
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
@@ -838,9 +999,14 @@ async def successful_payment_handler(message: Message) -> None:
             user = await get_or_create_user(db, telegram_id)
             from database import create_cabin
             await create_cabin(db, user["user_id"])
-            await update_cabin_durability(db, user["user_id"], 100.0, datetime.now())
+            await update_cabin_durability(db, user["user_id"], 100.0, datetime.now(timezone.utc))
             await update_cabin_storage(db, user["user_id"], 0, 0)
 
         await message.answer(RESTORE_SUCCESS, reply_markup=main_menu())
     except Exception:
+        # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s",
+            _current_handler_name(), message.from_user.id if message.from_user else '?',
+        )
         await message.answer(ERROR_GENERAL)
