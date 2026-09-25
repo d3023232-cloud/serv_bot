@@ -36,6 +36,12 @@ from config import (
     INVENTORY_TEXT,
     # NEW (добыча): тексты меню выбора места добычи и мгновенной добычи
     GATHER_MENU_TEXT,
+    # FIXED (мини-игра возвращена): тексты и параметры игры «найди предмет»
+    GATHER_GAME_TEXT,
+    GATHER_GAME_MISS,
+    GATHER_GAME_FAIL,
+    GATHER_GRID_SIZE,
+    GATHER_MAX_ATTEMPTS,
     GATHER_SAND_SUCCESS,
     GATHER_WOOD_SUCCESS,
     GATHER_STONE_SUCCESS,
@@ -120,8 +126,10 @@ def _parse_ts(raw) -> Optional[datetime]:
     return dt
 
 # ── FSM ──
-# FIXED (реплей кнопок добычи): мини-игра «найди предмет» заменена мгновенной
-# добычей по инлайн-кнопке — состояние GatherGame больше не нужно.
+# FIXED (мини-игра возвращена): состояние активной игры «найди предмет».
+class GatherGame(StatesGroup):
+    playing = State()
+
 class MarketState(StatesGroup):
     entering_amount = State()
 
@@ -222,6 +230,20 @@ def gather_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
+# FIXED (мини-игра возвращена): сетка 3x3 с случайной клеткой, где спрятан ресурс.
+def gather_game_kb(target_cell: int) -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура поля игры «найди предмет» (клетки gather:cell:N)."""
+    cells = []
+    for row in range(GATHER_GRID_SIZE):
+        line = []
+        for col in range(GATHER_GRID_SIZE):
+            idx = row * GATHER_GRID_SIZE + col
+            line.append(InlineKeyboardButton(
+                text="▪️", callback_data=f"gather:cell:{idx}:{target_cell}"))
+        cells.append(line)
+    return InlineKeyboardMarkup(inline_keyboard=cells)
+
+
 # ── Роутеры ──
 start_router = Router()
 inventory_router = Router()
@@ -297,11 +319,10 @@ async def gather_menu_handler(message: Message, state: FSMContext) -> None:
 
 
 async def _finish_gather(call: CallbackQuery, bot: Bot, resource: str) -> None:
-    """NEW (добыча): мгновенная добыча вместо мини-игры.
+    """FIXED (мини-игра возвращена): завершение добычи после победы в игре.
 
     Проверяет кулдаун, выдаёт случайное количество от 1 до максимума заход,
-    ставит кулдаун. Кулдаун ставится в момент добычи — «зависшей» игры больше
-    нет, поэтому проблема брошенной мини-игры (Задача 5) решается сама собой.
+    ставит кулдаун. Вызывается только при успешном нажатии на нужную клетку.
     """
     info = GATHER_RESOURCES[resource]
     async with aiosqlite.connect(DB_PATH) as db:
@@ -318,7 +339,7 @@ async def _finish_gather(call: CallbackQuery, bot: Bot, resource: str) -> None:
                     ).replace("<b>", "").replace("</b>", ""),
                     show_alert=True,
                 )
-                return
+                return False
 
         amount = random.randint(1, info["max_per_run"])
         new_coins = user.get("coins", 0)
@@ -334,17 +355,142 @@ async def _finish_gather(call: CallbackQuery, bot: Bot, resource: str) -> None:
         text=text, reply_markup=None,
     )
     await call.answer(f"✅ +{amount} {info['name'].lower()}!")
+    return True
 
 
 @gathering_router.callback_query(F.data.startswith("gather:"))
-async def gather_start_callback(call: CallbackQuery, bot: Bot) -> None:
-    """Обработчик инлайн-кнопок выбора места добычи."""
+async def gather_start_callback(call: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    """Инлайн-кнопки выбора места добычи → запуск мини-игры «найди предмет»."""
     try:
-        resource = call.data.split(":")[1]
+        parts = call.data.split(":")          # gather:<resource>
+        resource = parts[1]
         if resource not in GATHER_RESOURCES:
             await call.answer()
             return
-        await _finish_gather(call, bot, resource)
+        info = GATHER_RESOURCES[resource]
+
+        # Если юзер уже играет — не даём начать новую игру поверх старой.
+        current = await state.get_state()
+        if current == GatherGame.playing.state:
+            data = await state.get_data()
+            if data.get("resource"):
+                await call.answer("🎮 У тебя уже идёт игра! Нажми на клетку.", show_alert=True)
+                return
+
+        # Проверка кулдауна ДО запуска игры (как и раньше — чтобы не играть впустую).
+        async with aiosqlite.connect(DB_PATH) as db:
+            user = await get_or_create_user(db, call.from_user.id)
+            now = datetime.now(timezone.utc)
+            last = _parse_ts(user.get(info["column"]))
+            if last:
+                diff = (now - last).total_seconds()
+                if diff < info["cooldown"]:
+                    await call.answer(
+                        GATHER_COOLDOWN.format(
+                            emoji=info["emoji"], resource=info["name"].lower(),
+                            seconds=int(info["cooldown"] - diff),
+                        ).replace("<b>", "").replace("</b>", ""),
+                        show_alert=True,
+                    )
+                    return
+
+        # FIXED (Задача 5 / мини-игра): кулдаун ставится в МОМЕНТ СТАРТА игры,
+        # а не только по её итогам. Иначе юзер мог кликнуть 1–2 клетки, бросить
+        # игру и мгновенно начать новую. Первый вариант по ТЗ выбран сознательно:
+        # ужесточение баланса ровно на величину существующего кулдауна локации.
+        async with aiosqlite.connect(DB_PATH) as db:
+            await update_gather_cooldown(db, user["user_id"], resource, now)
+
+        target_cell = random.randint(0, GATHER_GRID_SIZE * GATHER_GRID_SIZE - 1)
+        await state.set_state(GatherGame.playing)
+        await state.update_data(resource=resource, attempts=GATHER_MAX_ATTEMPTS)
+
+        text = GATHER_GAME_TEXT.format(
+            emoji=info["emoji"], place=info["place"], name_lower=info["name"].lower(),
+            attempts=GATHER_MAX_ATTEMPTS, max=info["max_per_run"], cd=info["cooldown"],
+        )
+        await bot.edit_message_text(
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            text=text, reply_markup=gather_game_kb(target_cell),
+        )
+        await call.answer()
+    except Exception:
+        # FIXED (Задача 6): логируем с контекстом
+        logger.exception(
+            "HANDLER ERROR: handler=%s telegram_id=%s callback_data=%s",
+            _current_handler_name(),
+            call.from_user.id if call.from_user else '?',
+            call.data,
+        )
+        await call.answer(ERROR_GENERAL, show_alert=True)
+
+
+# FIXED (мини-игра возвращена): клик по клетке поля 3x3.
+# callback_data формата gather:cell:<выбрана>:<целевая>.
+@gathering_router.callback_query(GatherGame.playing, F.data.startswith("gather:cell:"))
+async def gather_cell_callback(call: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    try:
+        _, _, chosen_s, target_s = call.data.split(":")
+        chosen, target = int(chosen_s), int(target_s)
+
+        data = await state.get_data()
+        resource = data.get("resource")
+        if not resource or resource not in GATHER_RESOURCES:
+            # Состояние потеряно (например, рестарт бота) — выходим в меню добычи.
+            await state.clear()
+            await call.answer("Игра сброшена, начни заново.", show_alert=True)
+            return
+        info = GATHER_RESOURCES[resource]
+
+        if chosen == target:
+            # Победа: выдаём ресурс (кулдаун уже поставлен на старте игры,
+            # но обновляем метку на момент финала для точности).
+            await state.clear()
+            await _finish_gather(call, bot, resource)
+            return
+
+        attempts = int(data.get("attempts", GATHER_MAX_ATTEMPTS)) - 1
+        if attempts <= 0:
+            # Поражение: игра окончена, кулдаун со старта остаётся в силе.
+            await state.clear()
+            async with aiosqlite.connect(DB_PATH) as db:
+                user = await get_or_create_user(db, call.from_user.id)
+                last = _parse_ts(user.get(info["column"]))
+                remain = 0
+                if last:
+                    remain = max(0, int(info["cooldown"] - (datetime.now(timezone.utc) - last).total_seconds()))
+            await bot.edit_message_text(
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                text=GATHER_GAME_FAIL.format(name_lower=info["name"].lower(), seconds=remain),
+                reply_markup=None,
+            )
+            await call.answer("😔 Попытки закончились.")
+            return
+
+        await state.update_data(attempts=attempts)
+        # Меняем нажатую клетку на ❌ и пересобираем поле (цель та же).
+        kb_rows = []
+        for row in range(GATHER_GRID_SIZE):
+            line = []
+            for col in range(GATHER_GRID_SIZE):
+                idx = row * GATHER_GRID_SIZE + col
+                label = "❌" if idx == chosen else "▪️"
+                line.append(InlineKeyboardButton(
+                    text=label, callback_data=f"gather:cell:{idx}:{target}"))
+            kb_rows.append(line)
+        text = GATHER_GAME_TEXT.format(
+            emoji=info["emoji"], place=info["place"], name_lower=info["name"].lower(),
+            attempts=attempts, max=info["max_per_run"], cd=info["cooldown"],
+        ) + "\n\n" + GATHER_GAME_MISS.format(attempts=attempts)
+        await bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        )
+        await bot.edit_message_text(
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            text=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        )
+        await call.answer("❌ Пусто")
     except Exception:
         # FIXED (Задача 6): логируем с контекстом
         logger.exception(
