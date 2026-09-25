@@ -73,6 +73,10 @@ from config import (
     PRICE_BUY_STONE,
     PRICE_SELL_STONE,
     SAND_PRICE,  # NEW (песок): цена покупки на рынке
+    SELL_SAND_PRICE,  # FIXED (рынок): цена продажи песка
+    SELL_SAND_TEXT,   # FIXED (рынок): кнопка продажи песка
+    GATHER_CELL_EMPTY,  # FIXED (мини-игра): вид клетки поля
+    GATHER_CELL_MISS,
     WOOD_COOLDOWN,
     STONE_COOLDOWN,
     SAND_COOLDOWN,  # NEW (добыча): кулдауны и максимумы за заход
@@ -175,6 +179,7 @@ def buy_menu() -> InlineKeyboardMarkup:
 def sell_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text=SELL_SAND_TEXT, callback_data="sell:sand")],  # FIXED (рынок): продажа песка
             [InlineKeyboardButton(text=SELL_WOOD_TEXT, callback_data="sell:wood")],
             [InlineKeyboardButton(text=SELL_STONE_TEXT, callback_data="sell:stone")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="market:back")],
@@ -230,16 +235,21 @@ def gather_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
-# FIXED (мини-игра возвращена): сетка 3x3 с случайной клеткой, где спрятан ресурс.
+# FIXED (мини-игра возвращена): сетка 4x4 с случайной клеткой, где спрятан ресурс.
 def gather_game_kb(target_cell: int) -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура поля игры «найди предмет» (клетки gather:cell:N)."""
+    """Инлайн-клавиатура поля игры «найди предмет» (клетки gather:cell:N).
+
+    FIXED: все клетки имеют ОДИНАКОВЫЙ текст и ширину — иначе Telegram
+    не мог разложить их по 4 в ряд и показывал «вертикальный список».
+    Ресурс на кнопках НЕ подсвечивается (раньше был виден сразу).
+    """
     cells = []
     for row in range(GATHER_GRID_SIZE):
         line = []
         for col in range(GATHER_GRID_SIZE):
             idx = row * GATHER_GRID_SIZE + col
             line.append(InlineKeyboardButton(
-                text="▪️", callback_data=f"gather:cell:{idx}:{target_cell}"))
+                text=GATHER_CELL_EMPTY, callback_data=f"gather:cell:{idx}:{target_cell}"))
         cells.append(line)
     return InlineKeyboardMarkup(inline_keyboard=cells)
 
@@ -403,7 +413,7 @@ async def gather_start_callback(call: CallbackQuery, bot: Bot, state: FSMContext
 
         target_cell = random.randint(0, GATHER_GRID_SIZE * GATHER_GRID_SIZE - 1)
         await state.set_state(GatherGame.playing)
-        await state.update_data(resource=resource, attempts=GATHER_MAX_ATTEMPTS)
+        await state.update_data(resource=resource, attempts=GATHER_MAX_ATTEMPTS, opened=[])
 
         text = GATHER_GAME_TEXT.format(
             emoji=info["emoji"], place=info["place"], name_lower=info["name"].lower(),
@@ -425,7 +435,7 @@ async def gather_start_callback(call: CallbackQuery, bot: Bot, state: FSMContext
         await call.answer(ERROR_GENERAL, show_alert=True)
 
 
-# FIXED (мини-игра возвращена): клик по клетке поля 3x3.
+# FIXED (мини-игра возвращена): клик по клетке поля 4x4.
 # callback_data формата gather:cell:<выбрана>:<целевая>.
 @gathering_router.callback_query(GatherGame.playing, F.data.startswith("gather:cell:"))
 async def gather_cell_callback(call: CallbackQuery, bot: Bot, state: FSMContext) -> None:
@@ -441,6 +451,13 @@ async def gather_cell_callback(call: CallbackQuery, bot: Bot, state: FSMContext)
             await call.answer("Игра сброшена, начни заново.", show_alert=True)
             return
         info = GATHER_RESOURCES[resource]
+
+        opened = set(data.get("opened", []))  # клетки, куда уже кликали
+        if chosen in opened:
+            # FIXED: повторный клик по уже открытой клетке не тратит попытку.
+            await call.answer("Эта клетка уже открыта.")
+            return
+        opened.add(chosen)
 
         if chosen == target:
             # Победа: выдаём ресурс (кулдаун уже поставлен на старте игры,
@@ -467,14 +484,14 @@ async def gather_cell_callback(call: CallbackQuery, bot: Bot, state: FSMContext)
             await call.answer("😔 Попытки закончились.")
             return
 
-        await state.update_data(attempts=attempts)
-        # Меняем нажатую клетку на ❌ и пересобираем поле (цель та же).
+        await state.update_data(attempts=attempts, opened=sorted(opened))
+        # Открытые клетки → 🟫, остальные остаются 🔲 (цель не подсвечивается).
         kb_rows = []
         for row in range(GATHER_GRID_SIZE):
             line = []
             for col in range(GATHER_GRID_SIZE):
                 idx = row * GATHER_GRID_SIZE + col
-                label = "❌" if idx == chosen else "▪️"
+                label = GATHER_CELL_MISS if idx in opened else GATHER_CELL_EMPTY
                 line.append(InlineKeyboardButton(
                     text=label, callback_data=f"gather:cell:{idx}:{target}"))
             kb_rows.append(line)
@@ -482,10 +499,8 @@ async def gather_cell_callback(call: CallbackQuery, bot: Bot, state: FSMContext)
             emoji=info["emoji"], place=info["place"], name_lower=info["name"].lower(),
             attempts=attempts, max=info["max_per_run"], cd=info["cooldown"],
         ) + "\n\n" + GATHER_GAME_MISS.format(attempts=attempts)
-        await bot.edit_message_reply_markup(
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
-        )
+        # FIXED: один edit_message_text вместо двойного редактирования
+        # (reply_markup + text) — меньше лишних запросов к Telegram API.
         await bot.edit_message_text(
             chat_id=call.message.chat.id, message_id=call.message.message_id,
             text=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
@@ -612,9 +627,17 @@ async def buy_select(call: CallbackQuery, state: FSMContext) -> None:
 async def sell_select(call: CallbackQuery, state: FSMContext) -> None:
     try:
         resource = call.data.split(":")[1]
-        price = PRICE_SELL_WOOD if resource == "wood" else PRICE_SELL_STONE
-        emoji = "🪵" if resource == "wood" else "🪨"
-        res_name = "дерево" if resource == "wood" else "камень"
+        # FIXED (рынок): карта товаров вместо тернарников — добавлен песок
+        # (продажа 1💰/шт). Раньше сюда попадали только wood/stone.
+        _sell_info = {
+            "sand": (SELL_SAND_PRICE, "🏖", "песок"),
+            "wood": (PRICE_SELL_WOOD, "🪵", "дерево"),
+            "stone": (PRICE_SELL_STONE, "🪨", "камень"),
+        }
+        if resource not in _sell_info:
+            await call.answer()
+            return
+        price, emoji, res_name = _sell_info[resource]
 
         text = MARKET_ENTER_AMOUNT.format(
             mode_emoji="💰", mode="ПРОДАЖА", emoji=emoji,
@@ -720,8 +743,7 @@ async def market_process_amount(message: Message, state: FSMContext, bot: Bot) -
                 await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=buy_menu())
 
             else:
-                # NOTE (песок): продажа песка пока не добавлена в меню sell_menu,
-                # поэтому сюда попадают только wood/stone; .get("sand", 0) — на будущее.
+                # FIXED (рынок): продажа песка — обновляем и его колонку.
                 have = {"sand": user.get("sand", 0), "wood": user["wood"], "stone": user["stone"]}[resource]
                 if have < amount:
                     await message.delete()
@@ -736,14 +758,16 @@ async def market_process_amount(message: Message, state: FSMContext, bot: Bot) -
                 new_coins = coins + total
                 new_wood = user["wood"] - (amount if resource == "wood" else 0)
                 new_stone = user["stone"] - (amount if resource == "stone" else 0)
-                await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone)
+                new_sand = user.get("sand", 0) - (amount if resource == "sand" else 0)
+                await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone, new_sand)
 
+                _after = {"sand": new_sand, "wood": new_wood, "stone": new_stone}[resource]
                 text = SELL_SUCCESS.format(
                     amount=amount, resource=res_name, total=total,
                     coins_before=coins, coins_after=new_coins, emoji=emoji,
                     resource_cap=res_name_cap,
                     res_before=have,
-                    res_after=new_wood if resource == "wood" else new_stone,
+                    res_after=_after,
                 )
                 await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=sell_menu())
 
