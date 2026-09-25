@@ -9,6 +9,7 @@ from datetime import datetime, timezone  # FIXED (Задача 2): единое 
 from typing import Optional
 
 from aiogram import Router, F, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -75,8 +76,9 @@ from config import (
     SAND_PRICE,  # NEW (песок): цена покупки на рынке
     SELL_SAND_PRICE,  # FIXED (рынок): цена продажи песка
     SELL_SAND_TEXT,   # FIXED (рынок): кнопка продажи песка
-    GATHER_CELL_EMPTY,  # FIXED (мини-игра): вид клетки поля
+    GATHER_CELL_FILL,  # FIXED (UX мини-игры): заполнитель клетки
     GATHER_CELL_MISS,
+    GATHER_CELL_COLORS,
     WOOD_COOLDOWN,
     STONE_COOLDOWN,
     SAND_COOLDOWN,  # NEW (добыча): кулдауны и максимумы за заход
@@ -235,21 +237,30 @@ def gather_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
-# FIXED (мини-игра возвращена): сетка 4x4 с случайной клеткой, где спрятан ресурс.
-def gather_game_kb(target_cell: int) -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура поля игры «найди предмет» (клетки gather:cell:N).
+# FIXED (UX мини-игры): поле 3x3, клетки окрашены в цвет ресурса; спрятанный
+# ресурс виден как 🎯{emoji}. Заполнитель «▫️» одинаков во всех клетках ряда —
+# поэтому Telegram корректно раскладывает кнопки по 3 в ряд (сетка не «едет»).
+def _cell_text(idx: int, target_cell: int, opened: set, cell_color: str, res_emoji: str) -> str:
+    if idx == target_cell:
+        return f"🎯{res_emoji}{GATHER_CELL_FILL}"
+    if idx in opened:
+        return f"{GATHER_CELL_MISS}{GATHER_CELL_FILL}"
+    return f"{cell_color}{GATHER_CELL_FILL}"
 
-    FIXED: все клетки имеют ОДИНАКОВЫЙ текст и ширину — иначе Telegram
-    не мог разложить их по 4 в ряд и показывал «вертикальный список».
-    Ресурс на кнопках НЕ подсвечивается (раньше был виден сразу).
-    """
+
+def gather_game_kb(resource: str, target_cell: int, opened: set) -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура поля игры «найди предмет» (клетки gather:cell:N)."""
+    info = GATHER_RESOURCES[resource]
+    cell_color = GATHER_CELL_COLORS.get(resource, "⬜")
+    res_emoji = info["emoji"]
     cells = []
     for row in range(GATHER_GRID_SIZE):
         line = []
         for col in range(GATHER_GRID_SIZE):
             idx = row * GATHER_GRID_SIZE + col
             line.append(InlineKeyboardButton(
-                text=GATHER_CELL_EMPTY, callback_data=f"gather:cell:{idx}:{target_cell}"))
+                text=_cell_text(idx, target_cell, opened, cell_color, res_emoji),
+                callback_data=f"gather:cell:{idx}:{target_cell}"))
         cells.append(line)
     return InlineKeyboardMarkup(inline_keyboard=cells)
 
@@ -413,6 +424,9 @@ async def gather_start_callback(call: CallbackQuery, bot: Bot, state: FSMContext
 
         target_cell = random.randint(0, GATHER_GRID_SIZE * GATHER_GRID_SIZE - 1)
         await state.set_state(GatherGame.playing)
+        # FIXED (UX): цель видна на поле как 🎯{ресурс} — игрок должен успеть
+        # нажать на неё за ограниченное число попыток (промахи по пустым
+        # клеткам тратят попытки). Кулдаун уже поставлен на старте.
         await state.update_data(resource=resource, attempts=GATHER_MAX_ATTEMPTS, opened=[])
 
         text = GATHER_GAME_TEXT.format(
@@ -421,7 +435,7 @@ async def gather_start_callback(call: CallbackQuery, bot: Bot, state: FSMContext
         )
         await bot.edit_message_text(
             chat_id=call.message.chat.id, message_id=call.message.message_id,
-            text=text, reply_markup=gather_game_kb(target_cell),
+            text=text, reply_markup=gather_game_kb(resource, target_cell, set()),
         )
         await call.answer()
     except Exception:
@@ -468,33 +482,33 @@ async def gather_cell_callback(call: CallbackQuery, bot: Bot, state: FSMContext)
 
         attempts = int(data.get("attempts", GATHER_MAX_ATTEMPTS)) - 1
         if attempts <= 0:
-            # Поражение: игра окончена, кулдаун со старта остаётся в силе.
+            # FIXED (UX): проигрыш — игрок забирает ВСЁ, что уже добыл в этой
+            # игре (по части ресурса за каждую попытку), а не уходит ни с чем.
             await state.clear()
+            partial = max(1, info["max_per_run"] // GATHER_MAX_ATTEMPTS)
             async with aiosqlite.connect(DB_PATH) as db:
                 user = await get_or_create_user(db, call.from_user.id)
+                new_coins = user.get("coins", 0)
+                new_wood = user["wood"] + (partial if resource == "wood" else 0)
+                new_stone = user["stone"] + (partial if resource == "stone" else 0)
+                new_sand = user.get("sand", 0) + (partial if resource == "sand" else 0)
+                await update_user_resources(db, user["user_id"], new_coins, new_wood, new_stone, new_sand)
                 last = _parse_ts(user.get(info["column"]))
                 remain = 0
                 if last:
                     remain = max(0, int(info["cooldown"] - (datetime.now(timezone.utc) - last).total_seconds()))
             await bot.edit_message_text(
                 chat_id=call.message.chat.id, message_id=call.message.message_id,
-                text=GATHER_GAME_FAIL.format(name_lower=info["name"].lower(), seconds=remain),
+                text=GATHER_GAME_FAIL.format(amount=partial, emoji=info["emoji"], seconds=remain),
                 reply_markup=None,
             )
-            await call.answer("😔 Попытки закончились.")
+            await call.answer(f"⏱ Попытки закончились. Забрал +{partial}!")
             return
 
         await state.update_data(attempts=attempts, opened=sorted(opened))
-        # Открытые клетки → 🟫, остальные остаются 🔲 (цель не подсвечивается).
-        kb_rows = []
-        for row in range(GATHER_GRID_SIZE):
-            line = []
-            for col in range(GATHER_GRID_SIZE):
-                idx = row * GATHER_GRID_SIZE + col
-                label = GATHER_CELL_MISS if idx in opened else GATHER_CELL_EMPTY
-                line.append(InlineKeyboardButton(
-                    text=label, callback_data=f"gather:cell:{idx}:{target}"))
-            kb_rows.append(line)
+        # FIXED (UX): перерисовываем поле тем же gather_game_kb — клетки в цвет
+        # ресурса, промахи ❌, цель по-прежнему 🎯{ресурс}.
+        kb = gather_game_kb(resource, target, opened)
         text = GATHER_GAME_TEXT.format(
             emoji=info["emoji"], place=info["place"], name_lower=info["name"].lower(),
             attempts=attempts, max=info["max_per_run"], cd=info["cooldown"],
@@ -503,7 +517,7 @@ async def gather_cell_callback(call: CallbackQuery, bot: Bot, state: FSMContext)
         # (reply_markup + text) — меньше лишних запросов к Telegram API.
         await bot.edit_message_text(
             chat_id=call.message.chat.id, message_id=call.message.message_id,
-            text=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+            text=text, reply_markup=kb,
         )
         await call.answer("❌ Пусто")
     except Exception:
@@ -573,8 +587,20 @@ async def market_sell(call: CallbackQuery) -> None:
 async def market_back(call: CallbackQuery, state: FSMContext) -> None:
     try:
         await state.clear()
+        # FIXED (TelegramBadRequest "message is not modified"): если «Назад»
+        # нажали уже находясь на экране рынка — контент не меняется и Telegram
+        # отклоняет edit. В этом случае просто отвечаем на callback без правки.
+        if call.message.text and MARKET_WELCOME in call.message.text:
+            await call.answer("Ты уже на рынке 🙂")
+            return
         await call.message.edit_text(MARKET_WELCOME, reply_markup=market_menu())
         await call.answer()
+    except TelegramBadRequest as exc:
+        # Тот же случай гонки (сообщение успело обновиться) — не считаем ошибкой.
+        if "message is not modified" in str(exc):
+            await call.answer()
+        else:
+            raise
     except Exception:
         # FIXED (Задача 6): не глотаем исключение молча — логируем с контекстом
         logger.exception(
